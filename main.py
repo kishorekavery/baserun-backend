@@ -6,7 +6,13 @@ load_dotenv()
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
-from db.db_conn import init_db
+from db.db_conn import (
+    init_db,
+    init_external_db,
+    close_external_db,
+    check_external_db_health,
+    db_config,
+)
 from routers import (
     app_info,
     auth_ext,
@@ -20,8 +26,13 @@ from routers import (
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    # Initialize local SQLite tables
     await init_db()
+    # Initialize external DB connection pool if credentials are configured
+    await init_external_db()
     yield
+    # Gracefully close external DB connection pool
+    await close_external_db()
 
 
 app = FastAPI(
@@ -60,3 +71,21 @@ app.include_router(users_router.router, prefix="/api/v1")
 @app.get("/", tags=["health"])
 async def root():
     return {"status": "ok", "message": "Welcome to the Runners Application!"}
+
+
+@app.get("/health/db", tags=["health"])
+async def db_health():
+    """
+    Check the connectivity and status of configured databases (local SQLite and external DB).
+    """
+    import os
+    sqlite_ok = os.path.exists(db_config.database_path)
+    external_health = await check_external_db_health()
+    return {
+        "sqlite": {
+            "path": db_config.database_path,
+            "status": "ready" if sqlite_ok else "not_created",
+        },
+        "external_db": external_health,
+        "config": db_config.to_dict(mask_secrets=True),
+    }

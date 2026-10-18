@@ -1,7 +1,14 @@
 import os
 import aiosqlite
+from db.config import db_config, DatabaseConfig
+from db.external_db import (
+    external_db,
+    init_external_db,
+    close_external_db,
+    check_external_db_health,
+)
 
-DATABASE_PATH = os.getenv("DATABASE_PATH", "baserun.db")
+DATABASE_PATH = os.getenv("DATABASE_PATH", db_config.database_path)
 
 # --------- Init DB ---------
 async def init_db():

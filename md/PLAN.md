@@ -18,7 +18,7 @@
 - [x] Feature 1: User Authentication and Authorization
 - [ ] Feature 2: User Profile Management
 - [x] Feature 3: Calculate the State of the user by geolocation
-- [ ] Feature 4: DB config for the application
+- [x] Feature 4: DB config for the application
 
 **Out of scope (for now):**
 
