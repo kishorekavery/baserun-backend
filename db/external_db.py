@@ -52,32 +52,12 @@ class ExternalDatabaseManager:
             logger.info(
                 f"Connecting to external database at {self.config.external_host}:{self.config.external_port}/{self.config.external_name}..."
             )
-            # asyncpg accepts connection parameters or DSN
-            if self.config.external_database_url:
-                self._pool = await asyncpg.create_pool(
-                    dsn=self.config.external_database_url,
-                    min_size=self.config.external_min_connections,
-                    max_size=self.config.external_max_connections,
-                    command_timeout=self.config.external_timeout,
-                )
-            else:
-                ssl_arg = None
-                if self.config.external_sslmode in ["require", "verify-ca", "verify-full"]:
-                    ssl_arg = True
-                elif self.config.external_sslmode == "disable":
-                    ssl_arg = False
-
-                self._pool = await asyncpg.create_pool(
-                    host=self.config.external_host,
-                    port=self.config.external_port,
-                    database=self.config.external_name,
-                    user=self.config.external_user,
-                    password=self.config.external_password,
-                    ssl=ssl_arg,
-                    min_size=self.config.external_min_connections,
-                    max_size=self.config.external_max_connections,
-                    command_timeout=self.config.external_timeout,
-                )
+            self._pool = await asyncpg.create_pool(
+                dsn=target_url,
+                min_size=self.config.external_min_connections,
+                max_size=self.config.external_max_connections,
+                command_timeout=self.config.external_timeout,
+            )
             self._is_initialized = True
             logger.info("External database connection pool initialized successfully.")
             return True
