@@ -48,7 +48,9 @@ class DatabaseConfig:
         Supports both EXTERNAL_DB_* and standard DB_* variable prefixes.
         """
         db_type = os.getenv("DATABASE_TYPE", "sqlite").lower()
-        database_path = os.getenv("DATABASE_PATH", "baserun.db")
+        is_serverless = bool(os.getenv("VERCEL") or os.getenv("VERCEL_ENV") or os.getenv("AWS_LAMBDA_FUNCTION_NAME"))
+        default_db_path = "/tmp/baserun.db" if is_serverless else "baserun.db"
+        database_path = os.getenv("DATABASE_PATH", default_db_path)
 
         external_db_type = (
             os.getenv("EXTERNAL_DB_TYPE")

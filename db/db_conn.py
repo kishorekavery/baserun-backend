@@ -12,6 +12,9 @@ DATABASE_PATH = os.getenv("DATABASE_PATH", db_config.database_path)
 
 # --------- Init DB ---------
 async def init_db():
+    dir_name = os.path.dirname(os.path.abspath(DATABASE_PATH))
+    if dir_name:
+        os.makedirs(dir_name, exist_ok=True)
     async with aiosqlite.connect(DATABASE_PATH) as conn:
         # 1. Users table
         await conn.execute("""
