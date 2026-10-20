@@ -7,7 +7,7 @@ from models.datamodel import (
     ClubLeaderboardResponse,
     ClubListResponse,
 )
-from routers.core import get_current_user_optional
+from routers.core import get_current_user
 
 router = APIRouter(prefix="/api/v1/clubs", tags=["clubs"])
 
@@ -75,13 +75,13 @@ async def get_club_details(club_id: int):
 @router.post("/{club_id}/join")
 async def join_club(
     club_id: int,
-    user_id: str = Query("1"),
-    current_user: dict | None = Depends(get_current_user_optional),
+    user_id: str | None = Query(None),
+    current_user: dict = Depends(get_current_user),
 ):
     """
     Screen 11: 'Join' club button.
     """
-    actual_user_id = str(current_user["id"]) if current_user else user_id
+    actual_user_id = str(current_user["id"])
     conn = await sqlite_connection()
     try:
         club = await fetch_record(conn, "clubs", "id", (club_id,))
@@ -125,20 +125,57 @@ async def get_club_leaderboard(
         if not club:
             raise HTTPException(status_code=404, detail="Club not found")
 
-        # Mock rich top 5 contributors from design
-        members = [
-            ClubLeaderboardMember(rank=1, user_id="101", username="runvicky", avatar_url="https://images.unsplash.com/photo-1507003211169-0a1dd7228f2d?auto=format&fit=crop&w=150&q=80", territories=8, total_km=120.4, is_current_user=False),
-            ClubLeaderboardMember(rank=2, user_id="102", username="priya_r", avatar_url="https://images.unsplash.com/photo-1494790108377-be9c29b29330?auto=format&fit=crop&w=150&q=80", territories=6, total_km=98.7, is_current_user=False),
-            ClubLeaderboardMember(rank=3, user_id=str(current_user_id), username="adventurer99", avatar_url="https://images.unsplash.com/photo-1534528741775-53994a69daeb?auto=format&fit=crop&w=150&q=80", territories=5, total_km=76.2, is_current_user=True),
-            ClubLeaderboardMember(rank=4, user_id="103", username="karthik", avatar_url="https://images.unsplash.com/photo-1500648767791-00dcc994a43e?auto=format&fit=crop&w=150&q=80", territories=4, total_km=62.1, is_current_user=False),
-            ClubLeaderboardMember(rank=5, user_id="104", username="meena.run", avatar_url="https://images.unsplash.com/photo-1517841905240-472988babdf9?auto=format&fit=crop&w=150&q=80", territories=4, total_km=58.3, is_current_user=False),
-        ]
+        member_rows = await execute_query(
+            conn,
+            """
+            SELECT 
+                u.id as user_id,
+                u.username,
+                u.avatar_url,
+                cm.territories_contributed,
+                cm.km_contributed,
+                (SELECT count(*) FROM claimed_bases cb WHERE cb.user_id = u.id AND cb.status = 'active') as active_territories,
+                (SELECT COALESCE(SUM(r.distance_km), 0.0) FROM runs r WHERE r.user_id = u.id) as active_km
+            FROM club_members cm
+            JOIN users u ON cm.user_id = u.id
+            WHERE cm.club_id = ?
+            ORDER BY (cm.territories_contributed + (SELECT count(*) FROM claimed_bases cb WHERE cb.user_id = u.id AND cb.status = 'active')) DESC,
+                     (cm.km_contributed + (SELECT COALESCE(SUM(r.distance_km), 0.0) FROM runs r WHERE r.user_id = u.id)) DESC
+            LIMIT 5
+            """,
+            (club_id,),
+        )
+
+        members = []
+        for idx, r in enumerate(member_rows):
+            tot_terrs = (r["territories_contributed"] or 0) + (r["active_territories"] or 0)
+            tot_km = round((r["km_contributed"] or 0.0) + (r["active_km"] or 0.0), 1)
+            is_curr = str(r["user_id"]) == str(current_user_id)
+            members.append(ClubLeaderboardMember(
+                rank=idx + 1,
+                user_id=str(r["user_id"]),
+                username=r["username"],
+                avatar_url=r["avatar_url"] or "",
+                territories=tot_terrs,
+                total_km=tot_km,
+                is_current_user=is_curr,
+            ))
+
+        total_members_row = await execute_query_one(
+            conn, "SELECT count(*) as cnt FROM club_members WHERE club_id = ?", (club_id,)
+        )
+        total_members = total_members_row["cnt"] if total_members_row else club["member_count"]
+
+        total_terrs_row = await execute_query_one(
+            conn, "SELECT count(*) as cnt FROM claimed_bases WHERE club_id = ? AND status = 'active'", (club_id,)
+        )
+        total_terrs = total_terrs_row["cnt"] if total_terrs_row else club["territory_count"]
 
         return {
             "club_id": club["id"],
             "club_name": club["name"],
-            "total_members": club["member_count"],
-            "total_territories": club["territory_count"],
+            "total_members": total_members,
+            "total_territories": total_terrs,
             "leaderboard": members,
         }
     finally:

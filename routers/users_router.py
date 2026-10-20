@@ -131,10 +131,19 @@ async def _build_full_profile(user_id: str) -> dict:
 
 
 @router.get("/{user_id}/runs", response_model=RunHistoryResponse)
-async def get_user_runs(user_id: str):
+async def get_user_runs(
+    user_id: str,
+    current_user: dict = Depends(get_current_user),
+):
     """
     Screen 12: My Runs History
     """
+    if str(current_user["id"]) != str(user_id):
+        raise HTTPException(
+            status_code=403,
+            detail="Forbidden: You do not have permission to access these runs",
+        )
+
     conn = await sqlite_connection()
     try:
         rows = await execute_query(
@@ -198,14 +207,21 @@ async def get_user_achievements(user_id: str):
             "SELECT id, title, description, badge_icon, unlocked_at FROM achievements WHERE user_id = ? ORDER BY id ASC",
             (user_id,),
         )
-        # If user has no unlocked badges, return default milestone achievements preview
+        # If user has no unlocked badges yet, seed real starter achievements in DB
         if not rows:
-            default_badges = [
-                AchievementItem(id=1, title="First Territory", description="Claimed your very first base", badge_icon="crown", unlocked_at="2026-10-10"),
-                AchievementItem(id=2, title="Marina Explorer", description="Patrolled over 10 KM around Marina Beach", badge_icon="compass", unlocked_at="2026-10-12"),
-                AchievementItem(id=3, title="Club Hero", description="Contributed 5 territories to your running club", badge_icon="shield", unlocked_at="2026-10-14"),
-            ]
-            return {"user_id": user_id, "total_badges": len(default_badges), "achievements": default_badges}
+            await conn.executemany("""
+                INSERT INTO achievements (user_id, title, description, badge_icon)
+                VALUES (?, ?, ?, ?)
+            """, [
+                (user_id, "First Step", "Started your running journey with Base Run", "footprints"),
+                (user_id, "Cadence Initiate", "Recorded your first GPS telemetry", "activity"),
+            ])
+            await conn.commit()
+            rows = await execute_query(
+                conn,
+                "SELECT id, title, description, badge_icon, unlocked_at FROM achievements WHERE user_id = ? ORDER BY id ASC",
+                (user_id,),
+            )
 
         return {
             "user_id": user_id,

@@ -81,6 +81,10 @@ CREATE TABLE IF NOT EXISTS runs (
     elevation_gain_m REAL DEFAULT 0.0,
     start_time TEXT NOT NULL,
     end_time TEXT,
+    is_claimed INTEGER DEFAULT 0,
+    current_latitude REAL,
+    current_longitude REAL,
+    last_telemetry_at TEXT,
     created_at TEXT DEFAULT CURRENT_TIMESTAMP
 );
 CREATE INDEX IF NOT EXISTS idx_runs_activity ON runs(activity_id);
@@ -131,6 +135,7 @@ CREATE TABLE IF NOT EXISTS sessions (
     user_id INTEGER NOT NULL,
     created_at TEXT DEFAULT CURRENT_TIMESTAMP,
     expires_at TEXT NOT NULL,
+    last_seen_at TEXT DEFAULT CURRENT_TIMESTAMP,
     is_revoked INTEGER DEFAULT 0
 );
 CREATE INDEX IF NOT EXISTS idx_sessions_user ON sessions(user_id);

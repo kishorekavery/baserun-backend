@@ -120,6 +120,17 @@ async def init_db():
         await conn.execute("CREATE INDEX IF NOT EXISTS idx_runs_activity ON runs(activity_id)")
         await conn.execute("CREATE INDEX IF NOT EXISTS idx_runs_user ON runs(user_id)")
 
+        for col_def in [
+            "is_claimed INTEGER DEFAULT 0",
+            "current_latitude REAL",
+            "current_longitude REAL",
+            "last_telemetry_at TEXT",
+        ]:
+            try:
+                await conn.execute(f"ALTER TABLE runs ADD COLUMN {col_def}")
+            except Exception:
+                pass
+
         # 5. Clubs table
         await conn.execute("""
             CREATE TABLE IF NOT EXISTS clubs (
@@ -177,6 +188,53 @@ async def init_db():
                     (3, "Marina Striders", "Coastal runners patrolling the beaches from Lighthouse to Napier Bridge.", "https://images.unsplash.com/photo-1476480862126-209bfaa8edc8?auto=format&fit=crop&w=150&q=80", "#2196F3", 180, 8, 1150.2),
                 ])
 
+        # Seed initial community runners, club members, claimed territories, and achievements if users table is empty
+        async with conn.execute("SELECT count(*) as cnt FROM users") as cur:
+            row = await cur.fetchone()
+            if row and row[0] == 0:
+                from pwdlib import PasswordHash
+                pw_hash = PasswordHash.recommended().hash("RunnerPass123!")
+                await conn.executemany("""
+                    INSERT INTO users (id, username, email, hashed_password, first_name, last_name, territory_color, avatar_url, city, club_id)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """, [
+                    (1, "adventurer99", "adventurer99@baserun.app", pw_hash, "Arun", "Kumar", "#00E5FF", "https://images.unsplash.com/photo-1534528741775-53994a69daeb?auto=format&fit=crop&w=250&q=80", "Chennai, India", 1),
+                    (2, "runvicky", "runvicky@baserun.app", pw_hash, "Vicky", "R", "#E91E63", "https://images.unsplash.com/photo-1507003211169-0a1dd7228f2d?auto=format&fit=crop&w=150&q=80", "Chennai, India", 1),
+                    (3, "priya_r", "priya_r@baserun.app", pw_hash, "Priya", "R", "#FF9800", "https://images.unsplash.com/photo-1494790108377-be9c29b29330?auto=format&fit=crop&w=150&q=80", "Chennai, India", 1),
+                    (4, "karthik", "karthik@baserun.app", pw_hash, "Karthik", "S", "#76FF03", "https://images.unsplash.com/photo-1500648767791-00dcc994a43e?auto=format&fit=crop&w=150&q=80", "Chennai, India", 1),
+                    (5, "meena.run", "meena@baserun.app", pw_hash, "Meena", "K", "#00B0FF", "https://images.unsplash.com/photo-1517841905240-472988babdf9?auto=format&fit=crop&w=150&q=80", "Chennai, India", 1),
+                ])
+
+                await conn.executemany("""
+                    INSERT INTO club_members (club_id, user_id, role, territories_contributed, km_contributed)
+                    VALUES (?, ?, ?, ?, ?)
+                """, [
+                    (1, "2", "leader", 8, 120.4),
+                    (1, "3", "member", 6, 98.7),
+                    (1, "1", "member", 5, 76.2),
+                    (1, "4", "member", 4, 62.1),
+                    (1, "5", "member", 4, 58.3),
+                ])
+
+                sample_wkt_marina = "POLYGON((80.2707 13.0827, 80.2707 13.0937, 80.2817 13.0937, 80.2817 13.0827, 80.2707 13.0827))"
+                sample_wkt_anna = "POLYGON((80.2100 13.0850, 80.2100 13.0950, 80.2200 13.0950, 80.2200 13.0850, 80.2100 13.0850))"
+                await conn.executemany("""
+                    INSERT INTO claimed_bases (id, name, user_id, club_id, status, area, perimeter, polygon_wkt, color, total_runs, total_km)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """, [
+                    (1, "Marina Beach (North)", "1", 1, "active", 2400000.0, 4200.0, sample_wkt_marina, "#00E5FF", 3, 52.0),
+                    (2, "Anna Nagar Central", "2", 1, "active", 3100000.0, 4800.0, sample_wkt_anna, "#E91E63", 5, 84.0),
+                ])
+
+                await conn.executemany("""
+                    INSERT INTO achievements (user_id, title, description, badge_icon)
+                    VALUES (?, ?, ?, ?)
+                """, [
+                    ("1", "First Territory", "Claimed your very first base at Marina Beach", "crown"),
+                    ("1", "Marina Explorer", "Patrolled over 10 KM around Marina Beach", "compass"),
+                    ("1", "Club Hero", "Contributed 5 territories to your running club", "shield"),
+                ])
+
         # 8. Sessions table for server-side token management & revocation
         await conn.execute("""
             CREATE TABLE IF NOT EXISTS sessions (
@@ -185,9 +243,16 @@ async def init_db():
                 user_id INTEGER NOT NULL,
                 created_at TEXT DEFAULT CURRENT_TIMESTAMP,
                 expires_at TEXT NOT NULL,
+                last_seen_at TEXT DEFAULT CURRENT_TIMESTAMP,
                 is_revoked INTEGER DEFAULT 0
             )
         """)
+        # Safely migrate sessions table if column is missing in existing DB
+        try:
+            await conn.execute("ALTER TABLE sessions ADD COLUMN last_seen_at TEXT DEFAULT CURRENT_TIMESTAMP")
+        except Exception:
+            pass
+
         await conn.execute("CREATE INDEX IF NOT EXISTS idx_sessions_user ON sessions(user_id)")
         await conn.execute("CREATE INDEX IF NOT EXISTS idx_sessions_id ON sessions(session_id)")
 

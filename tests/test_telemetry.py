@@ -2,12 +2,10 @@ import uuid
 from datetime import datetime, timezone
 
 
-def test_record_telemetry_success(client):
+def test_record_telemetry_success(client, auth_headers):
     activity_id = str(uuid.uuid4())
-    user_id = str(uuid.uuid4())
     payload = {
         "activity_id": activity_id,
-        "user_id": user_id,
         "points": [
             {
                 "latitude": 37.7749,
@@ -27,7 +25,7 @@ def test_record_telemetry_success(client):
             }
         ]
     }
-    res = client.post("/api/v1/bases/telemetry", json=payload)
+    res = client.post("/api/v1/bases/telemetry", json=payload, headers=auth_headers)
     assert res.status_code == 200
     data = res.json()
     assert data["status"] == "success"
@@ -35,12 +33,10 @@ def test_record_telemetry_success(client):
     assert data["total_received"] == 2
 
 
-def test_record_telemetry_filters_inaccurate_gps(client):
+def test_record_telemetry_filters_inaccurate_gps(client, auth_headers):
     activity_id = str(uuid.uuid4())
-    user_id = str(uuid.uuid4())
     payload = {
         "activity_id": activity_id,
-        "user_id": user_id,
         "points": [
             {
                 "latitude": 37.7749,
@@ -58,19 +54,17 @@ def test_record_telemetry_filters_inaccurate_gps(client):
             }
         ]
     }
-    res = client.post("/api/v1/bases/telemetry", json=payload)
+    res = client.post("/api/v1/bases/telemetry", json=payload, headers=auth_headers)
     assert res.status_code == 200
     data = res.json()
     assert data["saved_points"] == 1
     assert data["total_received"] == 2
 
 
-def test_record_telemetry_filters_high_speed_anticheat(client):
+def test_record_telemetry_filters_high_speed_anticheat(client, auth_headers):
     activity_id = str(uuid.uuid4())
-    user_id = str(uuid.uuid4())
     payload = {
         "activity_id": activity_id,
-        "user_id": user_id,
         "points": [
             {
                 "latitude": 37.7749,
@@ -88,19 +82,17 @@ def test_record_telemetry_filters_high_speed_anticheat(client):
             }
         ]
     }
-    res = client.post("/api/v1/bases/telemetry", json=payload)
+    res = client.post("/api/v1/bases/telemetry", json=payload, headers=auth_headers)
     assert res.status_code == 200
     data = res.json()
     assert data["saved_points"] == 1
     assert data["total_received"] == 2
 
 
-def test_get_activity_telemetry_success(client):
+def test_get_activity_telemetry_success(client, auth_headers):
     activity_id = str(uuid.uuid4())
-    user_id = str(uuid.uuid4())
     post_payload = {
         "activity_id": activity_id,
-        "user_id": user_id,
         "points": [
             {
                 "latitude": 13.0827,
@@ -118,7 +110,7 @@ def test_get_activity_telemetry_success(client):
             }
         ]
     }
-    client.post("/api/v1/bases/telemetry", json=post_payload)
+    client.post("/api/v1/bases/telemetry", json=post_payload, headers=auth_headers)
 
     # Fetch recorded telemetry for this activity
     res = client.get(f"/api/v1/bases/telemetry/{activity_id}")

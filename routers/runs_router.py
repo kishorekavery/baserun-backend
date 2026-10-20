@@ -24,9 +24,9 @@ from models.datamodel import (
     StartRunResponse,
     TelemetryResponse,
 )
-from routers.core import get_current_user_optional
+from routers.core import get_current_user, get_activity_with_ownership
 
-router = APIRouter(prefix="/api/v1/runs", tags=["runs"])
+router = APIRouter(prefix="/runs", tags=["runs"])
 
 
 def _haversine_distance_km(lat1, lon1, lat2, lon2):
@@ -42,7 +42,7 @@ def _haversine_distance_km(lat1, lon1, lat2, lon2):
 @router.post("/start", response_model=StartRunResponse)
 async def start_run(
     request: StartRunRequest,
-    current_user: dict | None = Depends(get_current_user_optional),
+    current_user: dict = Depends(get_current_user),
 ):
     """
     Screen 6: Home Map - 'Start Run' button.
@@ -50,8 +50,8 @@ async def start_run(
     """
     activity_id = str(uuid.uuid4())
     start_time = datetime.now(timezone.utc).isoformat()
-    # Prioritize authenticated runner ID over arbitrary body string
-    user_id = str(current_user["id"]) if current_user else request.user_id
+    # Identity taken strictly from token
+    user_id = str(current_user["id"])
 
     conn = await sqlite_connection()
     try:
@@ -75,7 +75,11 @@ async def start_run(
 
 
 @router.post("/{activity_id}/telemetry", response_model=TelemetryResponse)
-async def stream_run_telemetry(activity_id: str, request: LocationBatch):
+async def stream_run_telemetry(
+    activity_id: str,
+    request: LocationBatch,
+    current_user: dict = Depends(get_current_user),
+):
     """
     Screen 7: Run In Progress - Streams live GPS points buffer.
     """
@@ -88,7 +92,7 @@ async def stream_run_telemetry(activity_id: str, request: LocationBatch):
         ts_str = point.timestamp.isoformat() if hasattr(point.timestamp, "isoformat") else str(point.timestamp)
         valid_points_data.append([
             activity_id,
-            str(request.user_id),
+            str(current_user["id"]),
             point.latitude,
             point.longitude,
             point.altitude or 0.0,
@@ -99,9 +103,7 @@ async def stream_run_telemetry(activity_id: str, request: LocationBatch):
 
     conn = await sqlite_connection()
     try:
-        run = await fetch_record(conn, "runs", "activity_id", (activity_id,))
-        if not run:
-            raise HTTPException(status_code=404, detail="Run activity not found")
+        run = await get_activity_with_ownership(conn, activity_id, current_user["id"])
 
         if valid_points_data:
             await insert_many_records(
@@ -123,7 +125,13 @@ async def stream_run_telemetry(activity_id: str, request: LocationBatch):
                     all_pts[i - 1]["latitude"], all_pts[i - 1]["longitude"],
                     all_pts[i]["latitude"], all_pts[i]["longitude"]
                 )
-            await conn.execute("UPDATE runs SET distance_km = ? WHERE activity_id = ?", (total_dist, activity_id))
+            
+            latest_pt = valid_points_data[-1]
+            await conn.execute("""
+                UPDATE runs 
+                SET distance_km = ?, current_latitude = ?, current_longitude = ?, last_telemetry_at = ?
+                WHERE activity_id = ?
+            """, (total_dist, latest_pt[2], latest_pt[3], latest_pt[7], activity_id))
             await conn.commit()
 
         return {
@@ -137,15 +145,16 @@ async def stream_run_telemetry(activity_id: str, request: LocationBatch):
 
 
 @router.post("/{activity_id}/pause", response_model=RunControlResponse)
-async def pause_run(activity_id: str):
+async def pause_run(
+    activity_id: str,
+    current_user: dict = Depends(get_current_user),
+):
     """
     Screen 7: Run In Progress - Pause running timer.
     """
     conn = await sqlite_connection()
     try:
-        run = await fetch_record(conn, "runs", "activity_id", (activity_id,))
-        if not run:
-            raise HTTPException(status_code=404, detail="Run activity not found")
+        run = await get_activity_with_ownership(conn, activity_id, current_user["id"])
         await conn.execute("UPDATE runs SET status = 'paused' WHERE activity_id = ?", (activity_id,))
         await conn.commit()
         return {"activity_id": activity_id, "status": "paused", "message": "Run paused"}
@@ -154,15 +163,16 @@ async def pause_run(activity_id: str):
 
 
 @router.post("/{activity_id}/resume", response_model=RunControlResponse)
-async def resume_run(activity_id: str):
+async def resume_run(
+    activity_id: str,
+    current_user: dict = Depends(get_current_user),
+):
     """
     Screen 7: Run In Progress - Resume paused run.
     """
     conn = await sqlite_connection()
     try:
-        run = await fetch_record(conn, "runs", "activity_id", (activity_id,))
-        if not run:
-            raise HTTPException(status_code=404, detail="Run activity not found")
+        run = await get_activity_with_ownership(conn, activity_id, current_user["id"])
         await conn.execute("UPDATE runs SET status = 'in_progress' WHERE activity_id = ?", (activity_id,))
         await conn.commit()
         return {"activity_id": activity_id, "status": "in_progress", "message": "Run resumed"}
@@ -173,7 +183,7 @@ async def resume_run(activity_id: str):
 @router.get("/{activity_id}/live", response_model=LiveRunStatsResponse)
 async def get_live_run_stats(activity_id: str):
     """
-    Screen 7: Live HUD metrics (Distance: 5.21 km, Duration: 32:18, Pace: 6'11" /km).
+    Screen 7: Live HUD metrics and real-time runner coordinates for map tracking.
     """
     conn = await sqlite_connection()
     try:
@@ -187,24 +197,46 @@ async def get_live_run_stats(activity_id: str):
             (activity_id,),
         )
         count = pts_count["cnt"] if pts_count else 0
-        speed_mps = pts_count["avg_speed"] or 2.7
+        speed_mps = pts_count["avg_speed"] or 0.0
         speed_kmh = round(speed_mps * 3.6, 1)
 
         # Compute duration
         start_dt = datetime.fromisoformat(run["start_time"])
         now_dt = datetime.now(timezone.utc)
-        duration_sec = int((now_dt - start_dt).total_seconds())
-        if duration_sec < 0:
-            duration_sec = 0
+        duration_sec = max(int((now_dt - start_dt).total_seconds()), 0)
         minutes = duration_sec // 60
         seconds = duration_sec % 60
         duration_fmt = f"{minutes:02d}:{seconds:02d}"
 
-        dist_km = run["distance_km"] or (count * 0.05)
-        pace_min = (duration_sec / 60) / dist_km if dist_km > 0.05 else 6.0
-        p_min = int(pace_min)
-        p_sec = int((pace_min - p_min) * 60)
-        pace_fmt = f"{p_min}'{p_sec:02d}\""
+        dist_km = run["distance_km"] or 0.0
+        if dist_km > 0.05 and duration_sec > 0:
+            pace_min = (duration_sec / 60) / dist_km
+            p_min = int(pace_min)
+            p_sec = int((pace_min - p_min) * 60)
+            pace_fmt = f"{p_min}'{p_sec:02d}\""
+        else:
+            pace_fmt = "0'00\""
+
+        # Latest GPS point and recent path for live map
+        last_pt = await execute_query_one(
+            conn,
+            "SELECT latitude, longitude, speed FROM telemetry_points WHERE activity_id = ? ORDER BY id DESC LIMIT 1",
+            (activity_id,),
+        )
+        current_lat = last_pt["latitude"] if last_pt else run["current_latitude"]
+        current_lng = last_pt["longitude"] if last_pt else run["current_longitude"]
+        if last_pt and last_pt["speed"] is not None and last_pt["speed"] > 0:
+            speed_kmh = round(last_pt["speed"] * 3.6, 1)
+
+        recent_rows = await execute_query(
+            conn,
+            "SELECT latitude, longitude, speed, timestamp FROM telemetry_points WHERE activity_id = ? ORDER BY id DESC LIMIT 50",
+            (activity_id,),
+        )
+        recent_pts = [
+            {"latitude": r["latitude"], "longitude": r["longitude"], "speed": r["speed"], "timestamp": r["timestamp"]}
+            for r in reversed(recent_rows)
+        ]
 
         return {
             "activity_id": activity_id,
@@ -215,67 +247,129 @@ async def get_live_run_stats(activity_id: str):
             "pace_formatted": pace_fmt,
             "current_speed_kmh": speed_kmh,
             "points_count": count,
+            "current_latitude": current_lat,
+            "current_longitude": current_lng,
+            "recent_points": recent_pts,
         }
     finally:
         await conn.close()
 
 
-@router.post("/{activity_id}/finish", response_model=RunSummaryResponse)
-async def finish_run(activity_id: str, request: FinishRunRequest):
+@router.get("/{activity_id}/path")
+async def get_run_full_path(activity_id: str):
     """
-    Screen 8: Run Summary - Finalizes run session and calculates summary metrics:
-    Steps (6,982), Calories (412 kcal), Avg Speed (9.7 km/h), Elevation (12 m).
+    Live breadcrumb path: Returns complete ordered GPS trail for map rendering.
     """
     conn = await sqlite_connection()
     try:
         run = await fetch_record(conn, "runs", "activity_id", (activity_id,))
         if not run:
             raise HTTPException(status_code=404, detail="Run activity not found")
+        pts = await execute_query(
+            conn,
+            "SELECT latitude, longitude, altitude, speed, timestamp FROM telemetry_points WHERE activity_id = ? ORDER BY id ASC",
+            (activity_id,),
+        )
+        return {
+            "activity_id": activity_id,
+            "total_points": len(pts),
+            "path": [
+                {
+                    "latitude": p["latitude"],
+                    "longitude": p["longitude"],
+                    "altitude": p["altitude"],
+                    "speed": p["speed"],
+                    "timestamp": p["timestamp"],
+                }
+                for p in pts
+            ]
+        }
+    finally:
+        await conn.close()
+
+
+@router.post("/{activity_id}/finish", response_model=RunSummaryResponse)
+async def finish_run(
+    activity_id: str,
+    request: FinishRunRequest,
+    current_user: dict = Depends(get_current_user),
+):
+    """
+    Screen 8: Run Summary - Finalizes run session and calculates summary metrics.
+    """
+    conn = await sqlite_connection()
+    try:
+        run = await get_activity_with_ownership(conn, activity_id, current_user["id"])
 
         end_time = datetime.now(timezone.utc).isoformat()
         start_dt = datetime.fromisoformat(run["start_time"])
         end_dt = datetime.fromisoformat(end_time)
         duration_sec = max(int((end_dt - start_dt).total_seconds()), 1)
 
-        # Points and loop analysis
+        # Points and loop analysis from DB
         pts = await execute_query(
             conn,
-            "SELECT latitude, longitude FROM telemetry_points WHERE activity_id = ? ORDER BY id ASC",
+            "SELECT latitude, longitude, altitude FROM telemetry_points WHERE activity_id = ? ORDER BY id ASC",
             (activity_id,),
         )
-        total_dist = run["distance_km"] or 5.21
-        if len(pts) >= 5 and total_dist == 0:
+        total_dist = run["distance_km"] or 0.0
+        if len(pts) >= 2 and total_dist == 0:
             for i in range(1, len(pts)):
                 total_dist += _haversine_distance_km(
                     pts[i - 1]["latitude"], pts[i - 1]["longitude"],
                     pts[i]["latitude"], pts[i]["longitude"]
                 )
+        elif total_dist == 0 and request.steps:
+            # If runner finished with device steps (e.g. smartwatch/treadmill), derive distance from steps
+            total_dist = round(request.steps / 1340, 2)
 
-        steps = request.steps or int(total_dist * 1340)  # ~1340 steps per km
-        calories = request.calories or int(total_dist * 79)  # ~79 kcal per km
-        elevation_gain = request.elevation_gain_m or 12.0
-        avg_speed_kmh = round((total_dist / (duration_sec / 3600)), 1) if duration_sec > 0 else 9.7
+        steps = request.steps if request.steps is not None else int(total_dist * 1340)
+        calories = request.calories if request.calories is not None else int(total_dist * 75)
+        
+        # Elevation gain from telemetry altitudes
+        elevation_gain = request.elevation_gain_m
+        if elevation_gain is None:
+            gain = 0.0
+            for i in range(1, len(pts)):
+                alt_prev = pts[i - 1]["altitude"] or 0.0
+                alt_curr = pts[i]["altitude"] or 0.0
+                if alt_curr > alt_prev:
+                    gain += (alt_curr - alt_prev)
+            elevation_gain = round(gain, 1) if gain > 0 else 0.0
+
+        if total_dist > 0 and duration_sec >= 10:
+            avg_speed_kmh = round((total_dist / (duration_sec / 3600)), 1)
+        elif total_dist > 0:
+            avg_speed_kmh = round(min(total_dist * 2.0, 9.7), 1)
+        else:
+            avg_speed_kmh = 0.0
 
         minutes = duration_sec // 60
         seconds = duration_sec % 60
         duration_fmt = f"{minutes:02d}:{seconds:02d}"
 
-        pace_min = (duration_sec / 60) / total_dist if total_dist > 0.05 else 6.18
-        p_min = int(pace_min)
-        p_sec = int((pace_min - p_min) * 60)
-        pace_fmt = f"{p_min}'{p_sec:02d}\""
+        if total_dist > 0.05 and duration_sec > 0:
+            pace_min = (duration_sec / 60) / total_dist
+            p_min = int(pace_min)
+            p_sec = int((pace_min - p_min) * 60)
+            pace_fmt = f"{p_min}'{p_sec:02d}\""
+        else:
+            pace_fmt = "0'00\""
 
         # Check if closed loop forms a claimable territory
         can_claim = False
         polygon_wkt = None
-        if len(pts) >= 5:
+        if len(pts) >= 3:
             try:
                 coords = [(p["longitude"], p["latitude"]) for p in pts]
+                # If loop is almost closed or closed
+                if coords[0] != coords[-1]:
+                    coords.append(coords[0])
                 poly = make_valid(Polygon(coords))
-                if poly.is_valid:
+                if poly.is_valid and not poly.is_empty:
                     geod = Geod(ellps='WGS84')
                     area, _ = geod.geometry_area_perimeter(poly)
-                    if 100 <= abs(area) <= 5000000:
+                    if abs(area) >= 100:
                         can_claim = True
                         polygon_wkt = poly.wkt
             except Exception:
@@ -295,7 +389,7 @@ async def finish_run(activity_id: str, request: FinishRunRequest):
         return {
             "activity_id": activity_id,
             "user_id": run["user_id"],
-            "title": run["title"] or "Marina Beach Loop",
+            "title": run["title"] or "City Run",
             "status": "completed",
             "date_formatted": date_fmt,
             "distance_km": round(total_dist, 2),
@@ -315,7 +409,7 @@ async def finish_run(activity_id: str, request: FinishRunRequest):
 @router.get("/{activity_id}/summary", response_model=RunSummaryResponse)
 async def get_run_summary(activity_id: str):
     """
-    Screen 8: Review completed run summary card.
+    Screen 8: Review completed run summary card from DB.
     """
     conn = await sqlite_connection()
     try:
@@ -324,24 +418,25 @@ async def get_run_summary(activity_id: str):
             raise HTTPException(status_code=404, detail="Run activity not found")
 
         start_dt = datetime.fromisoformat(run["start_time"])
-        minutes = run["duration_seconds"] // 60
-        seconds = run["duration_seconds"] % 60
+        duration_sec = run["duration_seconds"] or 0
+        minutes = duration_sec // 60
+        seconds = duration_sec % 60
         duration_fmt = f"{minutes:02d}:{seconds:02d}"
 
         return {
             "activity_id": activity_id,
             "user_id": run["user_id"],
-            "title": run["title"] or "Marina Beach Loop",
+            "title": run["title"] or "City Run",
             "status": run["status"],
             "date_formatted": start_dt.strftime("%b %d, %Y - %I:%M %p"),
-            "distance_km": round(run["distance_km"], 2),
+            "distance_km": round(run["distance_km"] or 0.0, 2),
             "duration_formatted": duration_fmt,
-            "pace_formatted": run["pace_min_per_km"] or "6'11\"",
-            "steps": run["steps"] or 6982,
-            "calories": run["calories"] or 412,
-            "avg_speed_kmh": run["avg_speed_kmh"] or 9.7,
-            "elevation_gain_m": run["elevation_gain_m"] or 12.0,
-            "can_claim_territory": True,
+            "pace_formatted": run["pace_min_per_km"] or "0'00\"",
+            "steps": run["steps"] or 0,
+            "calories": run["calories"] or 0,
+            "avg_speed_kmh": run["avg_speed_kmh"] or 0.0,
+            "elevation_gain_m": run["elevation_gain_m"] or 0.0,
+            "can_claim_territory": not bool(run["is_claimed"]),
             "polygon_wkt": None,
         }
     finally:

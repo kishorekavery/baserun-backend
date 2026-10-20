@@ -2,16 +2,15 @@ from datetime import datetime, timezone
 import uuid
 
 
-def test_screen_9_claim_territory_from_run(client):
+def test_screen_9_claim_territory_from_run(client, auth_headers):
     """Screen 9: Territory Claimed - Success Screen"""
     # Start and finish run
-    res_start = client.post("/api/v1/runs/start", json={"user_id": "1", "title": "Marina Beach Loop"})
+    res_start = client.post("/api/v1/runs/start", json={"title": "Marina Beach Loop"}, headers=auth_headers)
     act_id = res_start.json()["activity_id"]
 
     # Stream loop coordinates
     client.post(f"/api/v1/runs/{act_id}/telemetry", json={
         "activity_id": act_id,
-        "user_id": str(uuid.uuid4()),
         "points": [
             {"latitude": 13.0827, "longitude": 80.2707, "timestamp": datetime.now(timezone.utc).isoformat()},
             {"latitude": 13.0837, "longitude": 80.2707, "timestamp": datetime.now(timezone.utc).isoformat()},
@@ -19,15 +18,15 @@ def test_screen_9_claim_territory_from_run(client):
             {"latitude": 13.0827, "longitude": 80.2717, "timestamp": datetime.now(timezone.utc).isoformat()},
             {"latitude": 13.0827, "longitude": 80.2707, "timestamp": datetime.now(timezone.utc).isoformat()},
         ]
-    })
-    client.post(f"/api/v1/runs/{act_id}/finish", json={"steps": 6982, "calories": 412})
+    }, headers=auth_headers)
+    client.post(f"/api/v1/runs/{act_id}/finish", json={"steps": 6982, "calories": 412}, headers=auth_headers)
 
     # Submit for territory claim
     claim_payload = {
         "activity_id": act_id,
         "territory_name": "Marina Beach (North)"
     }
-    res = client.post("/api/v1/territories/claim-from-run", json=claim_payload)
+    res = client.post("/api/v1/territories/claim-from-run", json=claim_payload, headers=auth_headers)
     assert res.status_code == 200
     data = res.json()
     assert data["status"] == "success"
@@ -37,27 +36,39 @@ def test_screen_9_claim_territory_from_run(client):
     assert "#RunToClaim" in data["share_text"]
 
 
-def test_screen_10_territory_details_and_challenge(client):
+def test_screen_10_territory_details_and_challenge(client, auth_headers):
     """Screen 10: Territory Details and Challenge button"""
-    # 1. Get details for territory 1
-    res = client.get("/api/v1/territories/1")
+    # 0. Ensure at least one claimed base exists
+    base_res = client.post("/api/v1/bases/claim", json={
+        "points": [
+            {"latitude": 13.0820, "longitude": 80.2700, "timestamp": datetime.now(timezone.utc).isoformat()},
+            {"latitude": 13.0830, "longitude": 80.2700, "timestamp": datetime.now(timezone.utc).isoformat()},
+            {"latitude": 13.0830, "longitude": 80.2710, "timestamp": datetime.now(timezone.utc).isoformat()},
+            {"latitude": 13.0820, "longitude": 80.2710, "timestamp": datetime.now(timezone.utc).isoformat()},
+            {"latitude": 13.0820, "longitude": 80.2700, "timestamp": datetime.now(timezone.utc).isoformat()},
+        ]
+    }, headers=auth_headers)
+    assert base_res.status_code == 200
+    territory_id = base_res.json()["base_id"]
+
+    # 1. Get details for territory
+    res = client.get(f"/api/v1/territories/{territory_id}")
     assert res.status_code == 200
     data = res.json()
     assert "area_km2" in data
     assert "total_runs" in data
     assert "total_km" in data
     assert "days_active" in data
-    assert data["days_active"] == 7
 
     # 2. Challenge owner
-    res_chal = client.post("/api/v1/territories/1/challenge", json={"challenger_id": "runner_challenger"})
+    res_chal = client.post(f"/api/v1/territories/{territory_id}/challenge", json={}, headers=auth_headers)
     assert res_chal.status_code == 200
     chal_data = res_chal.json()
     assert chal_data["status"] == "challenge_active"
     assert "instructions" in chal_data
 
 
-def test_screen_11_clubs_and_leaderboard(client):
+def test_screen_11_clubs_and_leaderboard(client, auth_headers):
     """Screen 11: Clubs and Leaderboard top contributors"""
     # 1. List clubs
     res = client.get("/api/v1/clubs")
@@ -68,7 +79,7 @@ def test_screen_11_clubs_and_leaderboard(client):
     assert "Chennai Runners" in club_names
 
     # 2. Join club
-    res_join = client.post("/api/v1/clubs/1/join?user_id=1")
+    res_join = client.post("/api/v1/clubs/1/join", headers=auth_headers)
     assert res_join.status_code == 200
     assert "Successfully joined" in res_join.json()["message"]
 
@@ -97,7 +108,7 @@ def test_screen_12_profile_and_stats(client, auth_headers):
 
     # 2. My Runs
     user_id = str(prof["id"])
-    res_runs = client.get(f"/api/v1/users/{user_id}/runs")
+    res_runs = client.get(f"/api/v1/users/{user_id}/runs", headers=auth_headers)
     assert res_runs.status_code == 200
     assert "runs" in res_runs.json()
 

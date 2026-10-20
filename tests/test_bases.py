@@ -15,9 +15,9 @@ def make_valid_loop(user_id="user_test"):
     }
 
 
-def test_claim_base_success(client):
+def test_claim_base_success(client, auth_headers):
     payload = make_valid_loop("runner_claim_1")
-    res = client.post("/api/v1/bases/claim", json=payload)
+    res = client.post("/api/v1/bases/claim", json=payload, headers=auth_headers)
     assert res.status_code == 200
     data = res.json()
     assert data["status"] == "success"
@@ -27,7 +27,7 @@ def test_claim_base_success(client):
     assert "POLYGON" in data["polygon_wkt"]
 
 
-def test_claim_base_not_enough_points(client):
+def test_claim_base_not_enough_points(client, auth_headers):
     payload = {
         "user_id": "short_runner",
         "points": [
@@ -36,12 +36,12 @@ def test_claim_base_not_enough_points(client):
             {"latitude": 13.0837, "longitude": 80.2717, "timestamp": datetime.now(timezone.utc).isoformat()},
         ]
     }
-    res = client.post("/api/v1/bases/claim", json=payload)
+    res = client.post("/api/v1/bases/claim", json=payload, headers=auth_headers)
     assert res.status_code == 400
     assert "not enough points" in res.json()["detail"].lower()
 
 
-def test_claim_base_too_small_anticheat(client):
+def test_claim_base_too_small_anticheat(client, auth_headers):
     # Very tiny area (less than 1 meter displacement)
     payload = {
         "user_id": "tiny_runner",
@@ -53,14 +53,14 @@ def test_claim_base_too_small_anticheat(client):
             {"latitude": 13.082700, "longitude": 80.270700, "timestamp": datetime.now(timezone.utc).isoformat()},
         ]
     }
-    res = client.post("/api/v1/bases/claim", json=payload)
+    res = client.post("/api/v1/bases/claim", json=payload, headers=auth_headers)
     assert res.status_code == 200
     data = res.json()
     assert data["status"] == "failed"
     assert "too small" in data["message"].lower()
 
 
-def test_claim_base_too_large_anticheat(client):
+def test_claim_base_too_large_anticheat(client, auth_headers):
     # Giant area (e.g. crossing entire states, > 500,000 sq meters)
     payload = {
         "user_id": "giant_runner",
@@ -72,16 +72,16 @@ def test_claim_base_too_large_anticheat(client):
             {"latitude": 10.0, "longitude": 75.0, "timestamp": datetime.now(timezone.utc).isoformat()},
         ]
     }
-    res = client.post("/api/v1/bases/claim", json=payload)
+    res = client.post("/api/v1/bases/claim", json=payload, headers=auth_headers)
     assert res.status_code == 200
     data = res.json()
     assert data["status"] == "failed"
     assert "too large" in data["message"].lower()
 
 
-def test_get_bases_list(client):
+def test_get_bases_list(client, auth_headers):
     # Claim at least one base
-    client.post("/api/v1/bases/claim", json=make_valid_loop("runner_list_test"))
+    client.post("/api/v1/bases/claim", json=make_valid_loop(), headers=auth_headers)
 
     res = client.get("/api/v1/bases?limit=10")
     assert res.status_code == 200
@@ -92,26 +92,29 @@ def test_get_bases_list(client):
     assert len(data["bases"]) >= 1
 
 
-def test_get_bases_filtered_by_user(client):
-    target_user = f"user_{uuid.uuid4().hex[:6]}"
-    client.post("/api/v1/bases/claim", json=make_valid_loop(target_user))
+def test_get_bases_filtered_by_user(client, auth_headers):
+    me = client.get("/api/v1/bases/me", headers=auth_headers).json()
+    user_id = str(me["id"])
+    client.post("/api/v1/bases/claim", json=make_valid_loop(), headers=auth_headers)
 
-    res = client.get(f"/api/v1/bases?user_id={target_user}")
+    res = client.get(f"/api/v1/bases?user_id={user_id}")
     assert res.status_code == 200
     data = res.json()
-    assert data["total"] == 1
-    assert data["bases"][0]["user_id"] == target_user
+    assert data["total"] >= 1
+    assert data["bases"][0]["user_id"] == user_id
 
 
-def test_get_single_base_by_id(client):
-    res_claim = client.post("/api/v1/bases/claim", json=make_valid_loop("single_base_runner"))
+def test_get_single_base_by_id(client, auth_headers):
+    me = client.get("/api/v1/bases/me", headers=auth_headers).json()
+    user_id = str(me["id"])
+    res_claim = client.post("/api/v1/bases/claim", json=make_valid_loop(), headers=auth_headers)
     base_id = res_claim.json()["base_id"]
 
     res = client.get(f"/api/v1/bases/{base_id}")
     assert res.status_code == 200
     data = res.json()
     assert data["id"] == base_id
-    assert data["user_id"] == "single_base_runner"
+    assert data["user_id"] == user_id
     assert data["status"] == "active"
     assert "POLYGON" in data["polygon_wkt"]
 
@@ -121,15 +124,15 @@ def test_get_single_base_not_found(client):
     assert res.status_code == 404
 
 
-def test_get_user_stats(client):
-    stats_user = f"stats_user_{uuid.uuid4().hex[:6]}"
-    client.post("/api/v1/bases/claim", json=make_valid_loop(stats_user))
-    client.post("/api/v1/bases/claim", json=make_valid_loop(stats_user))
+def test_get_user_stats(client, auth_headers):
+    me = client.get("/api/v1/bases/me", headers=auth_headers).json()
+    user_id = str(me["id"])
+    client.post("/api/v1/bases/claim", json=make_valid_loop(), headers=auth_headers)
 
-    res = client.get(f"/api/v1/bases/user/{stats_user}/stats")
+    res = client.get(f"/api/v1/bases/user/{user_id}/stats")
     assert res.status_code == 200
     data = res.json()
-    assert data["user_id"] == stats_user
-    assert data["total_bases"] == 2
+    assert data["user_id"] == user_id
+    assert data["total_bases"] >= 1
     assert data["total_area_sq_meters"] > 0
     assert data["total_perimeter_meters"] > 0

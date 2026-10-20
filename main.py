@@ -65,6 +65,7 @@ app.include_router(clubs_router.router)
 # Also mount under /api/v1 for standard REST API versioning
 app.include_router(auth_ext.router, prefix="/api/v1")
 app.include_router(users_router.router, prefix="/api/v1")
+app.include_router(runs_router.router, prefix="/api/v1")
 
 
 

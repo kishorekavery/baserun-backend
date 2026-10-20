@@ -13,12 +13,11 @@ def test_screen_6_home_map(client):
     assert len(data["territories"]) >= 1
 
 
-def test_screen_6_start_run(client):
+def test_screen_6_start_run(client, auth_headers):
     """Screen 6: Home Map - 'Start Run' button initializes session"""
     res = client.post("/api/v1/runs/start", json={
-        "user_id": "1",
         "title": "Marina Beach Loop"
-    })
+    }, headers=auth_headers)
     assert res.status_code == 200
     data = res.json()
     assert data["status"] == "in_progress"
@@ -26,23 +25,22 @@ def test_screen_6_start_run(client):
     assert data["title"] == "Marina Beach Loop"
 
 
-def test_screen_7_run_in_progress_flow(client):
+def test_screen_7_run_in_progress_flow(client, auth_headers):
     """Screen 7: Run In Progress - Telemetry, Live HUD, Pause and Resume"""
     # 1. Start run
-    res_start = client.post("/api/v1/runs/start", json={"user_id": "1", "title": "Morning Run"})
+    res_start = client.post("/api/v1/runs/start", json={"title": "Morning Run"}, headers=auth_headers)
     act_id = res_start.json()["activity_id"]
 
     # 2. Stream telemetry points
     telemetry_payload = {
         "activity_id": act_id,
-        "user_id": str(uuid.uuid4()),
         "points": [
             {"latitude": 13.0827, "longitude": 80.2707, "timestamp": datetime.now(timezone.utc).isoformat(), "speed": 2.8, "accuracy": 4.0},
             {"latitude": 13.0837, "longitude": 80.2707, "timestamp": datetime.now(timezone.utc).isoformat(), "speed": 3.0, "accuracy": 4.0},
             {"latitude": 13.0837, "longitude": 80.2717, "timestamp": datetime.now(timezone.utc).isoformat(), "speed": 3.1, "accuracy": 4.0},
         ]
     }
-    res_telem = client.post(f"/api/v1/runs/{act_id}/telemetry", json=telemetry_payload)
+    res_telem = client.post(f"/api/v1/runs/{act_id}/telemetry", json=telemetry_payload, headers=auth_headers)
     assert res_telem.status_code == 200
     assert res_telem.json()["saved_points"] == 3
 
@@ -56,20 +54,20 @@ def test_screen_7_run_in_progress_flow(client):
     assert "pace_formatted" in live_data
 
     # 4. Pause run
-    res_pause = client.post(f"/api/v1/runs/{act_id}/pause")
+    res_pause = client.post(f"/api/v1/runs/{act_id}/pause", headers=auth_headers)
     assert res_pause.status_code == 200
     assert res_pause.json()["status"] == "paused"
 
     # 5. Resume run
-    res_resume = client.post(f"/api/v1/runs/{act_id}/resume")
+    res_resume = client.post(f"/api/v1/runs/{act_id}/resume", headers=auth_headers)
     assert res_resume.status_code == 200
     assert res_resume.json()["status"] == "in_progress"
 
 
-def test_screen_8_run_summary_finish(client):
+def test_screen_8_run_summary_finish(client, auth_headers):
     """Screen 8: Run Summary - Review run with steps, calories, elevation"""
     # 1. Start run
-    res_start = client.post("/api/v1/runs/start", json={"user_id": "1", "title": "Marina Beach Loop"})
+    res_start = client.post("/api/v1/runs/start", json={"title": "Marina Beach Loop"}, headers=auth_headers)
     act_id = res_start.json()["activity_id"]
 
     # 2. Finish run
@@ -78,7 +76,7 @@ def test_screen_8_run_summary_finish(client):
         "calories": 412,
         "elevation_gain_m": 12.0
     }
-    res_finish = client.post(f"/api/v1/runs/{act_id}/finish", json=finish_payload)
+    res_finish = client.post(f"/api/v1/runs/{act_id}/finish", json=finish_payload, headers=auth_headers)
     assert res_finish.status_code == 200
     summary = res_finish.json()
     assert summary["status"] == "completed"

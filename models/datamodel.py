@@ -90,13 +90,18 @@ class LocationPoint(BaseModel):
 
 class LocationBatch(BaseModel):
     points: List[LocationPoint]
-    activity_id: UUID = Field(..., description="Group Points to a specific run")
-    user_id: UUID 
+    activity_id: Optional[UUID] = Field(None, description="Group Points to a specific run")
+    user_id: Optional[UUID] = None
 
 
 class RunPath(BaseModel):
-    user_id: str
+    user_id: Optional[str] = None
     points: List[LocationPoint]
+
+
+# Aliases for backward compatibility
+TelemetryData = LocationBatch
+ClaimBaseRequest = RunPath
 
 
 class TelemetryResponse(BaseModel):
@@ -171,9 +176,18 @@ class AppConfigResponse(BaseModel):
 # ==========================================
 class SocialLoginRequest(BaseModel):
     provider: str = Field(..., description="google or apple")
-    token: str = Field(..., description="OAuth identity or access token")
+    token: Optional[str] = Field(None, description="OAuth identity or access token")
+    id_token: Optional[str] = Field(None, description="Alternative alias for token from Flutter plugins")
     email: Optional[EmailStr] = None
     name: Optional[str] = None
+
+    @model_validator(mode="after")
+    def validate_social_token(self) -> SocialLoginRequest:
+        if not self.token and not self.id_token:
+            raise ValueError("Either token or id_token is required")
+        if not self.token and self.id_token:
+            self.token = self.id_token
+        return self
 
 
 # ==========================================
@@ -252,7 +266,7 @@ class HomeMapResponse(BaseModel):
     territories: List[HomeMapTerritory]
 
 class StartRunRequest(BaseModel):
-    user_id: str
+    user_id: Optional[str] = None
     title: Optional[str] = "City Run"
 
 class StartRunResponse(BaseModel):
@@ -276,6 +290,9 @@ class LiveRunStatsResponse(BaseModel):
     pace_formatted: str
     current_speed_kmh: float
     points_count: int
+    current_latitude: Optional[float] = None
+    current_longitude: Optional[float] = None
+    recent_points: Optional[List[dict]] = None
 
 class RunControlResponse(BaseModel):
     activity_id: str
@@ -349,7 +366,7 @@ class TerritoryDetailResponse(BaseModel):
     is_owner: bool
 
 class ChallengeRequest(BaseModel):
-    challenger_id: str
+    challenger_id: Optional[str] = None
 
 class ChallengeResponse(BaseModel):
     challenge_id: str

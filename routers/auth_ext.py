@@ -13,7 +13,7 @@ from models.datamodel import (
     RegisterResponse,
     SocialLoginRequest,
 )
-from routers.core import create_access_token, password_hash, get_current_user, ACCESS_TOKEN_MINUTES
+from routers.core import create_access_token, password_hash, get_current_user, create_user_session
 
 router = APIRouter(prefix="/auth", tags=["auth"])
 
@@ -97,29 +97,15 @@ async def social_login(request: SocialLoginRequest):
         else:
             user_id = user["id"]
 
-        session_id = secrets.token_hex(32)
-        expires_delta = timedelta(minutes=ACCESS_TOKEN_MINUTES)
-        expire = datetime.now(timezone.utc) + expires_delta
-
-        token = create_access_token(
-            data={"sub": str(user_id), "jti": session_id},
-            expires_delta=expires_delta,
-        )
-
-        # Store session in server-side database
-        await conn.execute(
-            "INSERT INTO sessions (session_id, user_id, expires_at, is_revoked) VALUES (?, ?, ?, 0)",
-            (session_id, user_id, expire.isoformat()),
-        )
-        await conn.commit()
+        session_id, token, expires_in, expire_iso = await create_user_session(conn, user_id)
 
         return {
             "access_token": token,
             "token": token,
             "token_type": "bearer",
             "message": Message.LOGIN_SUCCESSFUL,
-            "expires_in": ACCESS_TOKEN_MINUTES * 60,
-            "expires_at": expire.isoformat(),
+            "expires_in": expires_in,
+            "expires_at": expire_iso,
             "session_id": session_id,
         }
     finally:

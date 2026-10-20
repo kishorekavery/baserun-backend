@@ -1,12 +1,12 @@
 import uuid
 import pytest
-from db.db_conn import sqlite_connection, execute_query_one, cleanup_expired_sessions
-from routers.core import ACCESS_TOKEN_MINUTES
+from db.db_conn import cleanup_expired_sessions
+from routers.core import SESSION_TTL_SECONDS
 
 
 def test_default_token_expiry_is_24_hours():
-    # 1440 minutes = 24 hours = 1 day
-    assert ACCESS_TOKEN_MINUTES == 1440
+    # 86400 seconds = 24 hours = 1 day
+    assert SESSION_TTL_SECONDS == 86400
 
 
 def test_register_creates_server_side_session(client):

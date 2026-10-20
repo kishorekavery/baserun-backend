@@ -44,8 +44,11 @@ router = APIRouter(
 
 SECRET_KEY = os.getenv("JWT_SECRET_KEY", "default-dev-secret-key-change-in-production")
 ALGORITHM = "HS256"
-# Configurable token expiration (default: 1440 minutes = 24 hours / 1 day)
-ACCESS_TOKEN_MINUTES = int(os.getenv("ACCESS_TOKEN_MINUTES", "1440"))
+# Session settings with production-safe defaults
+SESSION_TTL_SECONDS = int(os.getenv("SESSION_TTL_SECONDS", "86400"))
+SESSION_MODE = os.getenv("SESSION_MODE", "idle").strip().lower()
+MAX_SESSIONS_PER_USER = int(os.getenv("MAX_SESSIONS_PER_USER", "1"))
+SESSION_ABSOLUTE_MAX_SECONDS = int(os.getenv("SESSION_ABSOLUTE_MAX_SECONDS", "2592000"))
 
 password_hash = PasswordHash.recommended()
 oauth2_scheme = OAuth2PasswordBearer(tokenUrl="/api/v1/bases/login")
@@ -55,12 +58,14 @@ oauth2_scheme_optional = OAuth2PasswordBearer(tokenUrl="/api/v1/bases/login", au
 def create_access_token(data: dict, expires_delta: timedelta | None = None) -> str:
     """
     Creates signed cryptographic JWT with random session identifier (jti).
+    Default JWT expiration is hard upper limit SESSION_ABSOLUTE_MAX_SECONDS (30 days).
     """
     to_encode = data.copy()
     if expires_delta:
         expire = datetime.now(timezone.utc) + expires_delta
     else:
-        expire = datetime.now(timezone.utc) + timedelta(minutes=ACCESS_TOKEN_MINUTES)
+        abs_max = int(os.getenv("SESSION_ABSOLUTE_MAX_SECONDS", str(SESSION_ABSOLUTE_MAX_SECONDS)))
+        expire = datetime.now(timezone.utc) + timedelta(seconds=abs_max)
     to_encode.update({"exp": expire})
     if "iat" not in to_encode:
         to_encode["iat"] = int(datetime.now(timezone.utc).timestamp())
@@ -69,9 +74,53 @@ def create_access_token(data: dict, expires_delta: timedelta | None = None) -> s
     return jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
 
 
+async def create_user_session(conn, user_id: int) -> tuple[str, str, int, str]:
+    """
+    Creates a new session for user_id, enforcing MAX_SESSIONS_PER_USER limit.
+    Revokes older sessions beyond MAX_SESSIONS_PER_USER.
+    Returns (session_id, token, expires_in, expires_at_iso).
+    """
+    max_sessions = int(os.getenv("MAX_SESSIONS_PER_USER", str(MAX_SESSIONS_PER_USER)))
+    ttl_seconds = int(os.getenv("SESSION_TTL_SECONDS", str(SESSION_TTL_SECONDS)))
+    abs_max_seconds = int(os.getenv("SESSION_ABSOLUTE_MAX_SECONDS", str(SESSION_ABSOLUTE_MAX_SECONDS)))
+
+    # Fetch currently active sessions for this user ordered newest to oldest
+    active_rows = await execute_query(
+        conn,
+        "SELECT session_id FROM sessions WHERE user_id = ? AND is_revoked = 0 ORDER BY id DESC",
+        (user_id,),
+    )
+    # If adding 1 new session would exceed max_sessions, revoke the excess oldest active sessions
+    if len(active_rows) >= max_sessions:
+        keep_count = max_sessions - 1
+        to_revoke = active_rows[keep_count:] if keep_count > 0 else active_rows
+        for row in to_revoke:
+            await conn.execute("UPDATE sessions SET is_revoked = 1 WHERE session_id = ?", (row["session_id"],))
+
+    session_id = secrets.token_hex(32)
+    now_utc = datetime.now(timezone.utc)
+    expire_dt = now_utc + timedelta(seconds=ttl_seconds)
+    now_iso = now_utc.isoformat()
+    expire_iso = expire_dt.isoformat()
+
+    token = create_access_token(
+        data={"sub": str(user_id), "jti": session_id},
+        expires_delta=timedelta(seconds=abs_max_seconds),
+    )
+
+    await conn.execute(
+        "INSERT INTO sessions (session_id, user_id, created_at, expires_at, last_seen_at, is_revoked) VALUES (?, ?, ?, ?, ?, 0)",
+        (session_id, user_id, now_iso, expire_iso, now_iso),
+    )
+    await conn.commit()
+
+    return session_id, token, ttl_seconds, expire_iso
+
+
 async def get_current_user(token: str = Depends(oauth2_scheme)) -> dict:
     """
     Enforces server-time token expiry and verifies session state against server-side storage.
+    Extends session expiry in idle mode if more than 5 minutes have elapsed.
     """
     try:
         payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
@@ -83,6 +132,12 @@ async def get_current_user(token: str = Depends(oauth2_scheme)) -> dict:
                 detail="Invalid authentication credentials",
                 headers={"WWW-Authenticate": "Bearer"},
             )
+        if not session_id:
+            raise HTTPException(
+                status_code=401,
+                detail="Token missing session identifier (jti)",
+                headers={"WWW-Authenticate": "Bearer"},
+            )
     except jwt.PyJWTError:
         raise HTTPException(
             status_code=401,
@@ -92,19 +147,78 @@ async def get_current_user(token: str = Depends(oauth2_scheme)) -> dict:
 
     conn = await sqlite_connection()
     try:
-        # Check server-side session revocation
-        if session_id:
-            session_row = await execute_query_one(
-                conn,
-                "SELECT session_id, user_id, expires_at, is_revoked FROM sessions WHERE session_id = ?",
-                (session_id,),
+        session_row = await execute_query_one(
+            conn,
+            "SELECT session_id, user_id, created_at, expires_at, last_seen_at, is_revoked FROM sessions WHERE session_id = ?",
+            (session_id,),
+        )
+        if not session_row:
+            raise HTTPException(
+                status_code=401,
+                detail="Session not found or invalid",
+                headers={"WWW-Authenticate": "Bearer"},
             )
-            if session_row and session_row["is_revoked"] == 1:
-                raise HTTPException(
-                    status_code=401,
-                    detail="Session has been revoked",
-                    headers={"WWW-Authenticate": "Bearer"},
+
+        if session_row["is_revoked"] == 1:
+            raise HTTPException(
+                status_code=401,
+                detail="Session has been revoked",
+                headers={"WWW-Authenticate": "Bearer"},
+            )
+
+        # Enforce server-time session expiration
+        raw_expires_at = session_row["expires_at"]
+        if isinstance(raw_expires_at, str):
+            clean_str = raw_expires_at.replace("Z", "+00:00")
+            expires_at_dt = datetime.fromisoformat(clean_str)
+        else:
+            expires_at_dt = raw_expires_at
+
+        if expires_at_dt.tzinfo is None:
+            expires_at_dt = expires_at_dt.replace(tzinfo=timezone.utc)
+
+        now_utc = datetime.now(timezone.utc)
+        if expires_at_dt <= now_utc:
+            raise HTTPException(
+                status_code=401,
+                detail="Session expired",
+                headers={"WWW-Authenticate": "Bearer"},
+            )
+
+        # Idle mode sliding window extension
+        current_mode = os.getenv("SESSION_MODE", SESSION_MODE).strip().lower()
+        if current_mode == "idle":
+            raw_last_seen = session_row["last_seen_at"]
+            if raw_last_seen:
+                clean_last_seen = raw_last_seen.replace("Z", "+00:00")
+                last_seen_dt = datetime.fromisoformat(clean_last_seen)
+                if last_seen_dt.tzinfo is None:
+                    last_seen_dt = last_seen_dt.replace(tzinfo=timezone.utc)
+            else:
+                last_seen_dt = now_utc - timedelta(seconds=600)
+
+            # Throttled to 5 minutes (300 seconds)
+            if (now_utc - last_seen_dt).total_seconds() > 300:
+                ttl = int(os.getenv("SESSION_TTL_SECONDS", str(SESSION_TTL_SECONDS)))
+                abs_max = int(os.getenv("SESSION_ABSOLUTE_MAX_SECONDS", str(SESSION_ABSOLUTE_MAX_SECONDS)))
+                raw_created = session_row["created_at"]
+                if raw_created:
+                    clean_created = raw_created.replace("Z", "+00:00")
+                    created_dt = datetime.fromisoformat(clean_created)
+                    if created_dt.tzinfo is None:
+                        created_dt = created_dt.replace(tzinfo=timezone.utc)
+                else:
+                    created_dt = now_utc
+
+                abs_max_dt = created_dt + timedelta(seconds=abs_max)
+                candidate_expires = now_utc + timedelta(seconds=ttl)
+                new_expires_dt = min(candidate_expires, abs_max_dt)
+
+                await conn.execute(
+                    "UPDATE sessions SET last_seen_at = ?, expires_at = ? WHERE session_id = ?",
+                    (now_utc.isoformat(), new_expires_dt.isoformat(), session_id),
                 )
+                await conn.commit()
 
         user = await fetch_record(conn, "users", "id", (int(user_id),))
         if not user:
@@ -134,6 +248,30 @@ async def get_current_user_optional(token: str | None = Depends(oauth2_scheme_op
         return None
 
 
+def verify_ownership(owner_id: object, current_user_id: object) -> None:
+    """
+    Reusable ownership verification helper.
+    Compares owner to current user ID and raises 403 on mismatch.
+    """
+    if str(owner_id) != str(current_user_id):
+        raise HTTPException(
+            status_code=403,
+            detail="Forbidden: You do not have permission to modify this resource",
+        )
+
+
+async def get_activity_with_ownership(conn, activity_id: str, current_user_id: object) -> dict:
+    """
+    Loads a run activity by ID from the database and verifies ownership against caller's user ID.
+    Raises 404 if not found, 403 if caller is not the owner.
+    """
+    run = await fetch_record(conn, "runs", "activity_id", (activity_id,))
+    if not run:
+        raise HTTPException(status_code=404, detail="Run activity not found")
+    verify_ownership(run["user_id"], current_user_id)
+    return run
+
+
 @router.post("/register", response_model=RegisterResponse)
 async def register_user(request: RegisterRequest):
     conn = await sqlite_connection()
@@ -158,29 +296,15 @@ async def register_user(request: RegisterRequest):
             [request.username, hashed_password, first_name, last_name, request.email, phone],
         )
 
-        session_id = secrets.token_hex(32)
-        expires_delta = timedelta(minutes=ACCESS_TOKEN_MINUTES)
-        expire = datetime.now(timezone.utc) + expires_delta
-
-        token = create_access_token(
-            data={"sub": str(user_id), "jti": session_id},
-            expires_delta=expires_delta,
-        )
-
-        # Store session in server-side database
-        await conn.execute(
-            "INSERT INTO sessions (session_id, user_id, expires_at, is_revoked) VALUES (?, ?, ?, 0)",
-            (session_id, user_id, expire.isoformat()),
-        )
-        await conn.commit()
+        session_id, token, expires_in, expire_iso = await create_user_session(conn, user_id)
 
         return {
             "message": Message.USER_CREATED,
             "token": token,
             "access_token": token,
             "user_id": str(user_id),
-            "expires_in": ACCESS_TOKEN_MINUTES * 60,
-            "expires_at": expire.isoformat(),
+            "expires_in": expires_in,
+            "expires_at": expire_iso,
             "session_id": session_id,
         }
     except HTTPException:
@@ -209,35 +333,15 @@ async def login(request: LoginRequest):
         if not password_hash.verify(request.password, user["hashed_password"]):
             raise HTTPException(status_code=401, detail=Message.INVALID_USERNAME_OR_PASSWORD)
 
-        session_id = secrets.token_hex(32)
-        expires_delta = timedelta(minutes=ACCESS_TOKEN_MINUTES)
-        expire = datetime.now(timezone.utc) + expires_delta
-
-        token = create_access_token(
-            data={"sub": str(user["id"]), "jti": session_id},
-            expires_delta=expires_delta,
-        )
-
-        # Invalidate old sessions for this user on each new login
-        await conn.execute(
-            "UPDATE sessions SET is_revoked = 1 WHERE user_id = ? AND is_revoked = 0",
-            (user["id"],),
-        )
-
-        # Record new session in server-side database
-        await conn.execute(
-            "INSERT INTO sessions (session_id, user_id, expires_at, is_revoked) VALUES (?, ?, ?, 0)",
-            (session_id, user["id"], expire.isoformat()),
-        )
-        await conn.commit()
+        session_id, token, expires_in, expire_iso = await create_user_session(conn, user["id"])
 
         return {
             "access_token": token,
             "token": token,
             "token_type": "bearer",
             "message": Message.LOGIN_SUCCESSFUL,
-            "expires_in": ACCESS_TOKEN_MINUTES * 60,
-            "expires_at": expire.isoformat(),
+            "expires_in": expires_in,
+            "expires_at": expire_iso,
             "session_id": session_id,
         }
     except HTTPException:
@@ -276,7 +380,10 @@ async def get_me(user: dict = Depends(get_current_user)):
 
 
 @router.post("/telemetry", response_model=TelemetryResponse)
-async def record_telemetry(request: LocationBatch):
+async def record_telemetry(
+    request: LocationBatch,
+    current_user: dict = Depends(get_current_user),
+):
     valid_points_data = []
 
     for point in request.points:
@@ -288,7 +395,7 @@ async def record_telemetry(request: LocationBatch):
         ts_str = point.timestamp.isoformat() if hasattr(point.timestamp, "isoformat") else str(point.timestamp)
         valid_points_data.append([
             str(request.activity_id),
-            str(request.user_id),
+            str(current_user["id"]),
             point.latitude,
             point.longitude,
             point.altitude,
@@ -318,7 +425,10 @@ async def record_telemetry(request: LocationBatch):
 
 
 @router.post("/claim", response_model=ClaimBaseResponse)
-async def claim_base(request: RunPath):
+async def claim_base(
+    request: RunPath,
+    current_user: dict = Depends(get_current_user),
+):
     if len(request.points) < 5:
         raise HTTPException(status_code=400, detail="not enough points to claim an area")
 
@@ -357,7 +467,7 @@ async def claim_base(request: RunPath):
             "claimed_bases",
             ["user_id", "status", "area", "perimeter", "polygon_wkt"],
             [
-                str(request.user_id),
+                str(current_user["id"]),
                 "active",
                 round(area_sq_meters, 2),
                 round(perimeter, 2),
