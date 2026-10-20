@@ -1,4 +1,5 @@
 import os
+import secrets
 from datetime import datetime, timedelta, timezone
 
 from fastapi import APIRouter, Depends, HTTPException, Query
@@ -26,6 +27,7 @@ from models.datamodel import (
     LocationBatch,
     LoginRequest,
     LoginResponse,
+    LogoutResponse,
     Message,
     RegisterRequest,
     RegisterResponse,
@@ -42,23 +44,39 @@ router = APIRouter(
 
 SECRET_KEY = os.getenv("JWT_SECRET_KEY", "default-dev-secret-key-change-in-production")
 ALGORITHM = "HS256"
-ACCESS_TOKEN_MINUTES = 10080  # 7 days
+# Configurable token expiration (default: 1440 minutes = 24 hours / 1 day)
+ACCESS_TOKEN_MINUTES = int(os.getenv("ACCESS_TOKEN_MINUTES", "1440"))
 
 password_hash = PasswordHash.recommended()
 oauth2_scheme = OAuth2PasswordBearer(tokenUrl="/api/v1/bases/login")
+oauth2_scheme_optional = OAuth2PasswordBearer(tokenUrl="/api/v1/bases/login", auto_error=False)
 
 
-def create_access_token(data: dict, expires_delta: timedelta) -> str:
+def create_access_token(data: dict, expires_delta: timedelta | None = None) -> str:
+    """
+    Creates signed cryptographic JWT with random session identifier (jti).
+    """
     to_encode = data.copy()
-    expire = datetime.now(timezone.utc) + expires_delta
+    if expires_delta:
+        expire = datetime.now(timezone.utc) + expires_delta
+    else:
+        expire = datetime.now(timezone.utc) + timedelta(minutes=ACCESS_TOKEN_MINUTES)
     to_encode.update({"exp": expire})
+    if "iat" not in to_encode:
+        to_encode["iat"] = int(datetime.now(timezone.utc).timestamp())
+    if "jti" not in to_encode:
+        to_encode["jti"] = secrets.token_hex(32)
     return jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
 
 
 async def get_current_user(token: str = Depends(oauth2_scheme)) -> dict:
+    """
+    Enforces server-time token expiry and verifies session state against server-side storage.
+    """
     try:
         payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
         user_id: str = payload.get("sub")
+        session_id: str | None = payload.get("jti")
         if user_id is None:
             raise HTTPException(
                 status_code=401,
@@ -74,6 +92,20 @@ async def get_current_user(token: str = Depends(oauth2_scheme)) -> dict:
 
     conn = await sqlite_connection()
     try:
+        # Check server-side session revocation
+        if session_id:
+            session_row = await execute_query_one(
+                conn,
+                "SELECT session_id, user_id, expires_at, is_revoked FROM sessions WHERE session_id = ?",
+                (session_id,),
+            )
+            if session_row and session_row["is_revoked"] == 1:
+                raise HTTPException(
+                    status_code=401,
+                    detail="Session has been revoked",
+                    headers={"WWW-Authenticate": "Bearer"},
+                )
+
         user = await fetch_record(conn, "users", "id", (int(user_id),))
         if not user:
             raise HTTPException(
@@ -81,9 +113,25 @@ async def get_current_user(token: str = Depends(oauth2_scheme)) -> dict:
                 detail=Message.USER_NOT_FOUND,
                 headers={"WWW-Authenticate": "Bearer"},
             )
-        return dict(user)
+        user_dict = dict(user)
+        user_dict["current_session_id"] = session_id
+        return user_dict
     finally:
         await conn.close()
+
+
+async def get_current_user_optional(token: str | None = Depends(oauth2_scheme_optional)) -> dict | None:
+    """
+    Optional authentication dependency: verifies session if token is provided, returns None if not.
+    """
+    if not token:
+        return None
+    try:
+        return await get_current_user(token)
+    except HTTPException:
+        raise
+    except Exception:
+        return None
 
 
 @router.post("/register", response_model=RegisterResponse)
@@ -110,16 +158,30 @@ async def register_user(request: RegisterRequest):
             [request.username, hashed_password, first_name, last_name, request.email, phone],
         )
 
+        session_id = secrets.token_hex(32)
+        expires_delta = timedelta(minutes=ACCESS_TOKEN_MINUTES)
+        expire = datetime.now(timezone.utc) + expires_delta
+
         token = create_access_token(
-            data={"sub": str(user_id)},
-            expires_delta=timedelta(minutes=ACCESS_TOKEN_MINUTES),
+            data={"sub": str(user_id), "jti": session_id},
+            expires_delta=expires_delta,
         )
+
+        # Store session in server-side database
+        await conn.execute(
+            "INSERT INTO sessions (session_id, user_id, expires_at, is_revoked) VALUES (?, ?, ?, 0)",
+            (session_id, user_id, expire.isoformat()),
+        )
+        await conn.commit()
 
         return {
             "message": Message.USER_CREATED,
             "token": token,
             "access_token": token,
             "user_id": str(user_id),
+            "expires_in": ACCESS_TOKEN_MINUTES * 60,
+            "expires_at": expire.isoformat(),
+            "session_id": session_id,
         }
     except HTTPException:
         raise
@@ -147,16 +209,36 @@ async def login(request: LoginRequest):
         if not password_hash.verify(request.password, user["hashed_password"]):
             raise HTTPException(status_code=401, detail=Message.INVALID_USERNAME_OR_PASSWORD)
 
+        session_id = secrets.token_hex(32)
+        expires_delta = timedelta(minutes=ACCESS_TOKEN_MINUTES)
+        expire = datetime.now(timezone.utc) + expires_delta
+
         token = create_access_token(
-            data={"sub": str(user["id"])},
-            expires_delta=timedelta(minutes=ACCESS_TOKEN_MINUTES),
+            data={"sub": str(user["id"]), "jti": session_id},
+            expires_delta=expires_delta,
         )
+
+        # Invalidate old sessions for this user on each new login
+        await conn.execute(
+            "UPDATE sessions SET is_revoked = 1 WHERE user_id = ? AND is_revoked = 0",
+            (user["id"],),
+        )
+
+        # Record new session in server-side database
+        await conn.execute(
+            "INSERT INTO sessions (session_id, user_id, expires_at, is_revoked) VALUES (?, ?, ?, 0)",
+            (session_id, user["id"], expire.isoformat()),
+        )
+        await conn.commit()
+
         return {
             "access_token": token,
             "token": token,
             "token_type": "bearer",
             "message": Message.LOGIN_SUCCESSFUL,
             "expires_in": ACCESS_TOKEN_MINUTES * 60,
+            "expires_at": expire.isoformat(),
+            "session_id": session_id,
         }
     except HTTPException:
         raise
@@ -168,9 +250,29 @@ async def login(request: LoginRequest):
         await conn.close()
 
 
+@router.post("/logout", response_model=LogoutResponse)
+async def logout(current_user: dict = Depends(get_current_user)):
+    """
+    Invalidates current session on the server.
+    """
+    session_id = current_user.get("current_session_id")
+    if session_id:
+        conn = await sqlite_connection()
+        try:
+            await conn.execute(
+                "UPDATE sessions SET is_revoked = 1 WHERE session_id = ?",
+                (session_id,),
+            )
+            await conn.commit()
+        finally:
+            await conn.close()
+    return {"status": "success", "message": "Successfully logged out"}
+
+
 @router.get("/me", response_model=UserProfile)
 async def get_me(user: dict = Depends(get_current_user)):
     return user
+
 
 
 @router.post("/telemetry", response_model=TelemetryResponse)

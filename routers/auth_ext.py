@@ -1,17 +1,19 @@
-from datetime import timedelta
+from datetime import datetime, timedelta, timezone
+import secrets
 import uuid
-from fastapi import APIRouter, HTTPException, Query
+from fastapi import APIRouter, Depends, HTTPException, Query
 from db.db_conn import sqlite_connection, fetch_record, insert_records, insert_record_get_id
 from models.datamodel import (
     CheckUsernameResponse,
     LoginRequest,
     LoginResponse,
+    LogoutResponse,
     Message,
     RegisterRequest,
     RegisterResponse,
     SocialLoginRequest,
 )
-from routers.core import create_access_token, password_hash, ACCESS_TOKEN_MINUTES
+from routers.core import create_access_token, password_hash, get_current_user, ACCESS_TOKEN_MINUTES
 
 router = APIRouter(prefix="/auth", tags=["auth"])
 
@@ -34,9 +36,18 @@ async def auth_register(request: RegisterRequest):
     return await core.register_user(request)
 
 
+@router.post("/logout", response_model=LogoutResponse)
+async def auth_logout(current_user: dict = Depends(get_current_user)):
+    """
+    Flutter Logout Endpoint: POST /auth/logout
+    Invalidates current session on the server.
+    """
+    from routers import core
+    return await core.logout(current_user)
+
+
 @router.get("/check-username", response_model=CheckUsernameResponse)
 async def check_username(username: str = Query(..., min_length=3, max_length=32)):
-
     """
     Screen 3: Register - Real-time username availability check.
     Shows the green checkmark on Screen 3 & 4.
@@ -86,15 +97,31 @@ async def social_login(request: SocialLoginRequest):
         else:
             user_id = user["id"]
 
+        session_id = secrets.token_hex(32)
+        expires_delta = timedelta(minutes=ACCESS_TOKEN_MINUTES)
+        expire = datetime.now(timezone.utc) + expires_delta
+
         token = create_access_token(
-            data={"sub": str(user_id)},
-            expires_delta=timedelta(minutes=ACCESS_TOKEN_MINUTES),
+            data={"sub": str(user_id), "jti": session_id},
+            expires_delta=expires_delta,
         )
+
+        # Store session in server-side database
+        await conn.execute(
+            "INSERT INTO sessions (session_id, user_id, expires_at, is_revoked) VALUES (?, ?, ?, 0)",
+            (session_id, user_id, expire.isoformat()),
+        )
+        await conn.commit()
+
         return {
             "access_token": token,
+            "token": token,
             "token_type": "bearer",
             "message": Message.LOGIN_SUCCESSFUL,
             "expires_in": ACCESS_TOKEN_MINUTES * 60,
+            "expires_at": expire.isoformat(),
+            "session_id": session_id,
         }
     finally:
         await conn.close()
+

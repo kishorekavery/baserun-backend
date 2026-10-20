@@ -177,6 +177,20 @@ async def init_db():
                     (3, "Marina Striders", "Coastal runners patrolling the beaches from Lighthouse to Napier Bridge.", "https://images.unsplash.com/photo-1476480862126-209bfaa8edc8?auto=format&fit=crop&w=150&q=80", "#2196F3", 180, 8, 1150.2),
                 ])
 
+        # 8. Sessions table for server-side token management & revocation
+        await conn.execute("""
+            CREATE TABLE IF NOT EXISTS sessions (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                session_id TEXT NOT NULL UNIQUE,
+                user_id INTEGER NOT NULL,
+                created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+                expires_at TEXT NOT NULL,
+                is_revoked INTEGER DEFAULT 0
+            )
+        """)
+        await conn.execute("CREATE INDEX IF NOT EXISTS idx_sessions_user ON sessions(user_id)")
+        await conn.execute("CREATE INDEX IF NOT EXISTS idx_sessions_id ON sessions(session_id)")
+
         await conn.commit()
 
 
@@ -240,3 +254,22 @@ async def execute_query(conn: aiosqlite.Connection, query: str, params: tuple = 
 async def execute_query_one(conn: aiosqlite.Connection, query: str, params: tuple = ()):
     async with conn.execute(query, params) as cursor:
         return await cursor.fetchone()
+
+
+async def cleanup_expired_sessions() -> int:
+    """
+    Purges revoked sessions and sessions that have passed their expiration timestamp.
+    Returns total number of cleaned up sessions.
+    """
+    from datetime import datetime, timezone
+    conn = await sqlite_connection()
+    try:
+        now_iso = datetime.now(timezone.utc).isoformat()
+        cursor = await conn.execute(
+            "DELETE FROM sessions WHERE expires_at < ? OR is_revoked = 1",
+            (now_iso,)
+        )
+        await conn.commit()
+        return cursor.rowcount
+    finally:
+        await conn.close()

@@ -1,7 +1,7 @@
 from datetime import datetime, timezone
 import math
 import uuid
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, Depends, HTTPException
 from shapely.geometry import Polygon
 from shapely.validation import make_valid
 from pyproj import Geod
@@ -24,6 +24,7 @@ from models.datamodel import (
     StartRunResponse,
     TelemetryResponse,
 )
+from routers.core import get_current_user_optional
 
 router = APIRouter(prefix="/api/v1/runs", tags=["runs"])
 
@@ -39,13 +40,18 @@ def _haversine_distance_km(lat1, lon1, lat2, lon2):
 
 
 @router.post("/start", response_model=StartRunResponse)
-async def start_run(request: StartRunRequest):
+async def start_run(
+    request: StartRunRequest,
+    current_user: dict | None = Depends(get_current_user_optional),
+):
     """
     Screen 6: Home Map - 'Start Run' button.
     Initializes a new live running session and returns unique activity_id.
     """
     activity_id = str(uuid.uuid4())
     start_time = datetime.now(timezone.utc).isoformat()
+    # Prioritize authenticated runner ID over arbitrary body string
+    user_id = str(current_user["id"]) if current_user else request.user_id
 
     conn = await sqlite_connection()
     try:
@@ -53,11 +59,11 @@ async def start_run(request: StartRunRequest):
             conn,
             "runs",
             ["activity_id", "user_id", "title", "status", "start_time"],
-            [activity_id, request.user_id, request.title or "Marina Beach Loop", "in_progress", start_time],
+            [activity_id, user_id, request.title or "Marina Beach Loop", "in_progress", start_time],
         )
         return {
             "activity_id": activity_id,
-            "user_id": request.user_id,
+            "user_id": user_id,
             "title": request.title or "Marina Beach Loop",
             "status": "in_progress",
             "start_time": start_time,
@@ -65,6 +71,7 @@ async def start_run(request: StartRunRequest):
         }
     finally:
         await conn.close()
+
 
 
 @router.post("/{activity_id}/telemetry", response_model=TelemetryResponse)

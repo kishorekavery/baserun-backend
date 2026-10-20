@@ -35,6 +35,8 @@ class LoginResponse(BaseModel):
     token_type: str = "bearer"
     message: Message
     expires_in: int
+    expires_at: Optional[str] = None
+    session_id: Optional[str] = None
 
 
 class RegisterRequest(BaseModel):
@@ -52,6 +54,14 @@ class RegisterResponse(BaseModel):
     token: Optional[str] = None
     access_token: Optional[str] = None
     user_id: Optional[str] = None
+    expires_in: Optional[int] = None
+    expires_at: Optional[str] = None
+    session_id: Optional[str] = None
+
+
+class LogoutResponse(BaseModel):
+    status: str = "success"
+    message: str = "Successfully logged out"
 
 
 

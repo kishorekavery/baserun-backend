@@ -1,6 +1,6 @@
 from datetime import datetime, timezone
 import uuid
-from fastapi import APIRouter, HTTPException, Query
+from fastapi import APIRouter, Depends, HTTPException, Query
 from shapely.geometry import Polygon
 from shapely.validation import make_valid
 from pyproj import Geod
@@ -24,8 +24,10 @@ from models.datamodel import (
     TerritoryClaimedResponse,
     TerritoryDetailResponse,
 )
+from routers.core import get_current_user_optional
 
 router = APIRouter(prefix="/api/v1", tags=["territories"])
+
 
 
 @router.get("/territories/nearby", response_model=NearbyTerritoriesResponse)
@@ -170,7 +172,10 @@ async def get_home_map(
 
 
 @router.post("/territories/claim-from-run", response_model=TerritoryClaimedResponse)
-async def claim_territory_from_run(request: ClaimFromRunRequest):
+async def claim_territory_from_run(
+    request: ClaimFromRunRequest,
+    current_user: dict | None = Depends(get_current_user_optional),
+):
     """
     Screen 9: Territory Claimed (Success Screen)
     Converts a completed closed-loop run into an official claimed territory.
@@ -181,6 +186,11 @@ async def claim_territory_from_run(request: ClaimFromRunRequest):
         run = await fetch_record(conn, "runs", "activity_id", (request.activity_id,))
         if not run:
             raise HTTPException(status_code=404, detail="Run activity not found")
+
+        # If user is authenticated, ensure the run belongs to them
+        if current_user and str(run["user_id"]) != str(current_user["id"]):
+            raise HTTPException(status_code=403, detail="You do not own this running session")
+
 
         pts = await execute_query(
             conn,

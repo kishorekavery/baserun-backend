@@ -1,4 +1,4 @@
-from fastapi import APIRouter, HTTPException, Query
+from fastapi import APIRouter, Depends, HTTPException, Query
 from db.db_conn import sqlite_connection, fetch_record, execute_query, execute_query_one
 from models.datamodel import (
     BaseListResponse,
@@ -7,6 +7,7 @@ from models.datamodel import (
     ClubLeaderboardResponse,
     ClubListResponse,
 )
+from routers.core import get_current_user_optional
 
 router = APIRouter(prefix="/api/v1/clubs", tags=["clubs"])
 
@@ -72,10 +73,15 @@ async def get_club_details(club_id: int):
 
 
 @router.post("/{club_id}/join")
-async def join_club(club_id: int, user_id: str = Query("1")):
+async def join_club(
+    club_id: int,
+    user_id: str = Query("1"),
+    current_user: dict | None = Depends(get_current_user_optional),
+):
     """
     Screen 11: 'Join' club button.
     """
+    actual_user_id = str(current_user["id"]) if current_user else user_id
     conn = await sqlite_connection()
     try:
         club = await fetch_record(conn, "clubs", "id", (club_id,))
@@ -87,11 +93,12 @@ async def join_club(club_id: int, user_id: str = Query("1")):
             INSERT INTO club_members (club_id, user_id, role)
             VALUES (?, ?, 'member')
             ON CONFLICT(club_id, user_id) DO NOTHING
-        """, (club_id, user_id))
+        """, (club_id, actual_user_id))
 
-        await conn.execute("UPDATE users SET club_id = ? WHERE id = ?", (club_id, int(user_id) if user_id.isdigit() else 1))
+        await conn.execute("UPDATE users SET club_id = ? WHERE id = ?", (club_id, int(actual_user_id) if actual_user_id.isdigit() else 1))
         await conn.execute("UPDATE clubs SET member_count = member_count + 1 WHERE id = ?", (club_id,))
         await conn.commit()
+
 
         return {"status": "success", "message": f"Successfully joined {club['name']}!"}
     finally:
