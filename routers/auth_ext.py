@@ -80,12 +80,18 @@ async def social_login(request: SocialLoginRequest):
         raise HTTPException(status_code=400, detail="Unsupported social provider")
 
     email = request.email or f"{request.provider.lower()}_{uuid.uuid4().hex[:8]}@social.baserun.com"
-    username = (request.name or f"runner_{request.provider.lower()}_{uuid.uuid4().hex[:6]}").replace(" ", "").lower()
+    base_username = (request.name or f"runner_{request.provider.lower()}").replace(" ", "").lower()
+    username = base_username
 
     conn = await sqlite_connection()
     try:
         user = await fetch_record(conn, "users", "email", (email,))
         if not user:
+            # Check if desired username already exists, if so append random suffix
+            existing_by_uname = await fetch_record(conn, "users", "username", (username,))
+            if existing_by_uname:
+                username = f"{base_username}_{uuid.uuid4().hex[:6]}"
+
             # Create user on first social login
             random_pw = password_hash.hash(uuid.uuid4().hex)
             user_id = await insert_record_get_id(
