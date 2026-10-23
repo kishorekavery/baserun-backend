@@ -24,7 +24,7 @@ from models.datamodel import (
     TerritoryClaimedResponse,
     TerritoryDetailResponse,
 )
-from routers.core import get_current_user, get_activity_with_ownership
+from routers.core import get_current_user, get_activity_with_ownership, verify_ownership
 
 router = APIRouter(prefix="/api/v1", tags=["territories"])
 
@@ -180,7 +180,19 @@ async def claim_territory_from_run(
     """
     conn = await sqlite_connection()
     try:
-        run = await get_activity_with_ownership(conn, request.activity_id, current_user["id"])
+        run = await fetch_record(conn, "runs", "activity_id", (request.activity_id,))
+        now_iso = datetime.now(timezone.utc).isoformat()
+        if not run:
+            # Auto-recover offline or serverless cold-started run session for authenticated user
+            await insert_records(
+                conn,
+                "runs",
+                ["activity_id", "user_id", "title", "start_time", "end_time", "status", "distance_km", "duration_seconds", "is_claimed"],
+                [request.activity_id, str(current_user["id"]), request.territory_name or "Circuit Run", now_iso, now_iso, "completed", request.perimeter_km or 1.0, 300, 0]
+            )
+            run = await fetch_record(conn, "runs", "activity_id", (request.activity_id,))
+        else:
+            verify_ownership(run["user_id"], current_user["id"])
 
         if run["is_claimed"] == 1:
             raise HTTPException(status_code=400, detail="This run has already been claimed as a territory")
@@ -190,10 +202,36 @@ async def claim_territory_from_run(
             "SELECT latitude, longitude FROM telemetry_points WHERE activity_id = ? ORDER BY id ASC",
             (request.activity_id,),
         )
+
+        # Ingest client points if DB points are insufficient
+        if len(pts) < 3 and request.points and len(request.points) >= 3:
+            records = [
+                (
+                    request.activity_id,
+                    str(current_user["id"]),
+                    p.latitude,
+                    p.longitude,
+                    p.altitude or 0.0,
+                    p.speed or 0.0,
+                    p.accuracy or 5.0,
+                    p.timestamp.isoformat() if hasattr(p.timestamp, 'isoformat') else str(p.timestamp),
+                )
+                for p in request.points
+            ]
+            await conn.executemany(
+                """
+                INSERT INTO telemetry_points (activity_id, user_id, latitude, longitude, altitude, speed, accuracy, timestamp)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                records,
+            )
+            await conn.commit()
+            pts = [{"latitude": p.latitude, "longitude": p.longitude} for p in request.points]
+
         if len(pts) < 3:
             raise HTTPException(
                 status_code=400,
-                detail="At least 3 GPS points forming a closed loop are required to claim territory",
+                detail="At least 3 GPS points forming a closed loop are required to claim territory. Please make sure location tracking is on and complete a circuit.",
             )
 
         coords = [(p["longitude"], p["latitude"]) for p in pts]
@@ -209,6 +247,9 @@ async def claim_territory_from_run(
         area_sqm = abs(area)
         perimeter_m = abs(perimeter)
         area_km2 = round(area_sqm / 1_000_000, 2)
+        if area_km2 == 0 and request.area_km2:
+            area_km2 = request.area_km2
+            area_sqm = area_km2 * 1_000_000
 
         user = await fetch_record(conn, "users", "id", (int(run["user_id"]) if str(run["user_id"]).isdigit() else 1,))
         owner_username = user["username"] if user else current_user["username"]

@@ -24,7 +24,7 @@ from models.datamodel import (
     StartRunResponse,
     TelemetryResponse,
 )
-from routers.core import get_current_user, get_activity_with_ownership
+from routers.core import get_current_user, get_activity_with_ownership, verify_ownership
 
 router = APIRouter(prefix="/runs", tags=["runs"])
 
@@ -299,9 +299,20 @@ async def finish_run(
     """
     conn = await sqlite_connection()
     try:
-        run = await get_activity_with_ownership(conn, activity_id, current_user["id"])
-
+        run = await fetch_record(conn, "runs", "activity_id", (activity_id,))
         end_time = datetime.now(timezone.utc).isoformat()
+        if not run:
+            # Auto-recover offline or serverless cold-started run session
+            await insert_records(
+                conn,
+                "runs",
+                ["activity_id", "user_id", "title", "start_time", "end_time", "status", "distance_km", "duration_seconds", "is_claimed"],
+                [activity_id, str(current_user["id"]), "Completed Run", end_time, end_time, "completed", request.distance_km or 0.0, 60, 0]
+            )
+            run = await fetch_record(conn, "runs", "activity_id", (activity_id,))
+        else:
+            verify_ownership(run["user_id"], current_user["id"])
+
         start_dt = datetime.fromisoformat(run["start_time"])
         end_dt = datetime.fromisoformat(end_time)
         duration_sec = max(int((end_dt - start_dt).total_seconds()), 1)
@@ -312,7 +323,33 @@ async def finish_run(
             "SELECT latitude, longitude, altitude FROM telemetry_points WHERE activity_id = ? ORDER BY id ASC",
             (activity_id,),
         )
-        total_dist = run["distance_km"] or 0.0
+
+        # Ingest client points if DB points are insufficient
+        if len(pts) < 3 and request.points and len(request.points) >= 3:
+            records = [
+                (
+                    activity_id,
+                    str(current_user["id"]),
+                    p.latitude,
+                    p.longitude,
+                    p.altitude or 0.0,
+                    p.speed or 0.0,
+                    p.accuracy or 5.0,
+                    p.timestamp.isoformat() if hasattr(p.timestamp, 'isoformat') else str(p.timestamp),
+                )
+                for p in request.points
+            ]
+            await conn.executemany(
+                """
+                INSERT INTO telemetry_points (activity_id, user_id, latitude, longitude, altitude, speed, accuracy, timestamp)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                records,
+            )
+            await conn.commit()
+            pts = [{"latitude": p.latitude, "longitude": p.longitude, "altitude": p.altitude or 0.0} for p in request.points]
+
+        total_dist = run["distance_km"] or (request.distance_km or 0.0)
         if len(pts) >= 2 and total_dist == 0:
             for i in range(1, len(pts)):
                 total_dist += _haversine_distance_km(

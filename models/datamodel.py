@@ -307,6 +307,8 @@ class FinishRunRequest(BaseModel):
     steps: Optional[int] = None
     calories: Optional[int] = None
     elevation_gain_m: Optional[float] = None
+    points: Optional[List[LocationPoint]] = None
+    distance_km: Optional[float] = None
 
 class RunSummaryResponse(BaseModel):
     activity_id: str
@@ -331,6 +333,9 @@ class RunSummaryResponse(BaseModel):
 class ClaimFromRunRequest(BaseModel):
     activity_id: str
     territory_name: Optional[str] = None
+    points: Optional[List[LocationPoint]] = None
+    area_km2: Optional[float] = None
+    perimeter_km: Optional[float] = None
 
 class TerritoryClaimedResponse(BaseModel):
     status: str
