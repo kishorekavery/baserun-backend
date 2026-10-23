@@ -73,7 +73,7 @@ def test_user_b_cannot_resume_user_a_run(client: TestClient, users_a_and_b):
     # User A resumes their own run -> expect 200 OK
     res_a_resume = client.post(f"/api/v1/runs/{act_id}/resume", headers=headers_a)
     assert res_a_resume.status_code == 200
-    assert res_a_resume.json()["status"] == "in_progress"
+    assert res_a_resume.json()["status"] == "recording"
 
 
 def test_user_b_cannot_finish_user_a_run(client: TestClient, users_a_and_b):

@@ -1,143 +1,179 @@
 -- ====================================================================
--- Base Run: Run to Claim Database Schema (SQLite)
--- Supports all 12 mobile UI screens:
--- 1. Splash Screen
--- 2. Login
--- 3. Register
--- 4. Username & Color (Choose Your Identity)
--- 5. Location Permission & Nearby Territory Preview
--- 6. Home Map
--- 7. Run In Progress (Live Tracking)
--- 8. Run Summary
--- 9. Territory Claimed
--- 10. Territory Details & Challenge
--- 11. Club Leaderboard
--- 12. User Profile, Stats & Achievements
+-- BASER (Run to Claim) — PostgreSQL schema
+-- Idempotent: safe to run on every cold start.
+-- Geometry is computed in Python (shapely + pyproj geodesics) and stored
+-- as WKT with a bounding box, so plain PostgreSQL is enough (no PostGIS).
 -- ====================================================================
 
--- 1. Users table
-CREATE TABLE IF NOT EXISTS users (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    username TEXT NOT NULL UNIQUE,
-    email TEXT NOT NULL UNIQUE,
-    hashed_password TEXT NOT NULL,
-    first_name TEXT NOT NULL,
-    last_name TEXT,
-    phone TEXT,
-    territory_color TEXT DEFAULT '#00E5FF',
-    avatar_url TEXT DEFAULT 'https://images.unsplash.com/photo-1534528741775-53994a69daeb?auto=format&fit=crop&w=250&q=80',
-    city TEXT DEFAULT 'Chennai, India',
-    club_id INTEGER,
-    created_at TEXT DEFAULT CURRENT_TIMESTAMP
+CREATE TABLE IF NOT EXISTS schema_migrations (
+    version INTEGER PRIMARY KEY,
+    applied_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
--- 2. Telemetry points table for in-run GPS tracking
-CREATE TABLE IF NOT EXISTS telemetry_points (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    activity_id TEXT NOT NULL,
-    user_id TEXT NOT NULL,
-    latitude REAL NOT NULL,
-    longitude REAL NOT NULL,
-    altitude REAL,
-    speed REAL,
-    accuracy REAL,
-    timestamp TEXT NOT NULL,
-    created_at TEXT DEFAULT CURRENT_TIMESTAMP
+-- 1. Seasons
+CREATE TABLE IF NOT EXISTS seasons (
+    id SERIAL PRIMARY KEY,
+    name VARCHAR(120) NOT NULL UNIQUE,
+    starts_at TIMESTAMPTZ NOT NULL,
+    ends_at TIMESTAMPTZ,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
-CREATE INDEX IF NOT EXISTS idx_telemetry_activity ON telemetry_points(activity_id);
-CREATE INDEX IF NOT EXISTS idx_telemetry_user ON telemetry_points(user_id);
 
--- 3. Claimed bases / territories table
-CREATE TABLE IF NOT EXISTS claimed_bases (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    name TEXT NOT NULL DEFAULT 'Territory',
-    user_id TEXT NOT NULL,
-    club_id INTEGER,
-    status TEXT NOT NULL DEFAULT 'active',
-    area REAL NOT NULL,
-    perimeter REAL NOT NULL,
-    polygon_wkt TEXT NOT NULL,
-    color TEXT DEFAULT '#00E5FF',
-    total_runs INTEGER DEFAULT 1,
-    total_km REAL DEFAULT 0.0,
-    last_active_at TEXT DEFAULT CURRENT_TIMESTAMP,
-    created_at TEXT DEFAULT CURRENT_TIMESTAMP
-);
-CREATE INDEX IF NOT EXISTS idx_bases_user ON claimed_bases(user_id);
-
--- 4. Runs / Activities table
-CREATE TABLE IF NOT EXISTS runs (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    activity_id TEXT NOT NULL UNIQUE,
-    user_id TEXT NOT NULL,
-    title TEXT DEFAULT 'City Run',
-    status TEXT NOT NULL DEFAULT 'in_progress',
-    distance_km REAL DEFAULT 0.0,
-    duration_seconds INTEGER DEFAULT 0,
-    pace_min_per_km TEXT DEFAULT '0''00"',
-    steps INTEGER DEFAULT 0,
-    calories INTEGER DEFAULT 0,
-    avg_speed_kmh REAL DEFAULT 0.0,
-    elevation_gain_m REAL DEFAULT 0.0,
-    start_time TEXT NOT NULL,
-    end_time TEXT,
-    is_claimed INTEGER DEFAULT 0,
-    current_latitude REAL,
-    current_longitude REAL,
-    last_telemetry_at TEXT,
-    created_at TEXT DEFAULT CURRENT_TIMESTAMP
-);
-CREATE INDEX IF NOT EXISTS idx_runs_activity ON runs(activity_id);
-CREATE INDEX IF NOT EXISTS idx_runs_user ON runs(user_id);
-
--- 5. Clubs table
+-- 2. Clubs (member / territory counts are aggregated live, never stored)
 CREATE TABLE IF NOT EXISTS clubs (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    name TEXT NOT NULL UNIQUE,
+    id SERIAL PRIMARY KEY,
+    name VARCHAR(100) NOT NULL UNIQUE,
+    tagline VARCHAR(255),
     description TEXT,
     avatar_url TEXT,
-    color TEXT DEFAULT '#E91E63',
-    member_count INTEGER DEFAULT 1,
-    territory_count INTEGER DEFAULT 0,
-    total_km REAL DEFAULT 0.0,
-    created_at TEXT DEFAULT CURRENT_TIMESTAMP
+    color VARCHAR(7) NOT NULL DEFAULT '#E91E63',
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
--- 6. Club Members table
-CREATE TABLE IF NOT EXISTS club_members (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    club_id INTEGER NOT NULL,
-    user_id TEXT NOT NULL,
-    role TEXT DEFAULT 'member',
-    territories_contributed INTEGER DEFAULT 0,
-    km_contributed REAL DEFAULT 0.0,
-    joined_at TEXT DEFAULT CURRENT_TIMESTAMP,
-    UNIQUE(club_id, user_id)
+-- 3. Users
+CREATE TABLE IF NOT EXISTS users (
+    id SERIAL PRIMARY KEY,
+    username VARCHAR(32) NOT NULL,
+    email VARCHAR(255) NOT NULL,
+    hashed_password TEXT NOT NULL,
+    first_name VARCHAR(64) NOT NULL DEFAULT 'Runner',
+    last_name VARCHAR(64),
+    phone VARCHAR(32),
+    territory_color VARCHAR(7) NOT NULL DEFAULT '#00E5FF',
+    avatar_url TEXT,
+    bio TEXT,
+    city VARCHAR(120) DEFAULT 'Chennai, India',
+    club_id INTEGER REFERENCES clubs(id) ON DELETE SET NULL,
+    auth_provider VARCHAR(20) NOT NULL DEFAULT 'password',
+    is_active BOOLEAN NOT NULL DEFAULT TRUE,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
-CREATE INDEX IF NOT EXISTS idx_club_members_club ON club_members(club_id);
-CREATE INDEX IF NOT EXISTS idx_club_members_user ON club_members(user_id);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_users_username_lower ON users (LOWER(username));
+CREATE UNIQUE INDEX IF NOT EXISTS idx_users_email_lower ON users (LOWER(email));
+CREATE INDEX IF NOT EXISTS idx_users_club ON users (club_id);
 
--- 7. Achievements table
-CREATE TABLE IF NOT EXISTS achievements (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    user_id TEXT NOT NULL,
-    title TEXT NOT NULL,
-    description TEXT NOT NULL,
-    badge_icon TEXT NOT NULL,
-    unlocked_at TEXT DEFAULT CURRENT_TIMESTAMP
-);
-CREATE INDEX IF NOT EXISTS idx_achievements_user ON achievements(user_id);
-
--- 8. Sessions table for server-side token management & revocation
+-- 4. Server-side sessions (JWT jti -> session row)
 CREATE TABLE IF NOT EXISTS sessions (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    session_id TEXT NOT NULL UNIQUE,
-    user_id INTEGER NOT NULL,
-    created_at TEXT DEFAULT CURRENT_TIMESTAMP,
-    expires_at TEXT NOT NULL,
-    last_seen_at TEXT DEFAULT CURRENT_TIMESTAMP,
-    is_revoked INTEGER DEFAULT 0
+    id BIGSERIAL PRIMARY KEY,
+    session_id VARCHAR(128) NOT NULL UNIQUE,
+    user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    expires_at TIMESTAMPTZ NOT NULL,
+    last_seen_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    is_revoked BOOLEAN NOT NULL DEFAULT FALSE
 );
-CREATE INDEX IF NOT EXISTS idx_sessions_user ON sessions(user_id);
-CREATE INDEX IF NOT EXISTS idx_sessions_id ON sessions(session_id);
+CREATE INDEX IF NOT EXISTS idx_sessions_user ON sessions (user_id);
 
+-- 5. Runs / activities. activity_id is TEXT because offline clients mint their own ids.
+CREATE TABLE IF NOT EXISTS runs (
+    id BIGSERIAL PRIMARY KEY,
+    activity_id VARCHAR(128) NOT NULL UNIQUE,
+    user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    title VARCHAR(120) NOT NULL DEFAULT 'City Run',
+    status VARCHAR(20) NOT NULL DEFAULT 'recording'
+        CHECK (status IN ('recording', 'paused', 'completed')),
+    route_mode VARCHAR(32) NOT NULL DEFAULT 'free_run',
+    target_territory_id INTEGER,
+    device_info VARCHAR(255),
+    is_recovered BOOLEAN NOT NULL DEFAULT FALSE,
+    start_time TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    end_time TIMESTAMPTZ,
+    paused_at TIMESTAMPTZ,
+    total_paused_seconds INTEGER NOT NULL DEFAULT 0,
+    start_latitude DOUBLE PRECISION,
+    start_longitude DOUBLE PRECISION,
+    current_latitude DOUBLE PRECISION,
+    current_longitude DOUBLE PRECISION,
+    last_telemetry_at TIMESTAMPTZ,
+    distance_km DOUBLE PRECISION NOT NULL DEFAULT 0,
+    duration_seconds INTEGER NOT NULL DEFAULT 0,
+    avg_pace_seconds INTEGER NOT NULL DEFAULT 0,
+    steps INTEGER NOT NULL DEFAULT 0,
+    calories INTEGER NOT NULL DEFAULT 0,
+    avg_speed_kmh DOUBLE PRECISION NOT NULL DEFAULT 0,
+    elevation_gain_m DOUBLE PRECISION NOT NULL DEFAULT 0,
+    is_loop_closed BOOLEAN NOT NULL DEFAULT FALSE,
+    loop_area_km2 DOUBLE PRECISION NOT NULL DEFAULT 0,
+    loop_polygon_wkt TEXT,
+    is_claimed BOOLEAN NOT NULL DEFAULT FALSE,
+    claim_outcome VARCHAR(20),
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+CREATE INDEX IF NOT EXISTS idx_runs_user ON runs (user_id, id DESC);
+CREATE INDEX IF NOT EXISTS idx_runs_status ON runs (status, last_telemetry_at);
+
+-- 6. GPS telemetry
+CREATE TABLE IF NOT EXISTS telemetry_points (
+    id BIGSERIAL PRIMARY KEY,
+    run_id BIGINT NOT NULL REFERENCES runs(id) ON DELETE CASCADE,
+    latitude DOUBLE PRECISION NOT NULL,
+    longitude DOUBLE PRECISION NOT NULL,
+    altitude DOUBLE PRECISION,
+    speed DOUBLE PRECISION,
+    accuracy DOUBLE PRECISION,
+    recorded_at TIMESTAMPTZ NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_telemetry_run ON telemetry_points (run_id, id);
+
+-- 7. Territories (bases)
+CREATE TABLE IF NOT EXISTS territories (
+    id SERIAL PRIMARY KEY,
+    name VARCHAR(120) NOT NULL,
+    owner_id INTEGER REFERENCES users(id) ON DELETE SET NULL,
+    club_id INTEGER REFERENCES clubs(id) ON DELETE SET NULL,
+    origin_run_id BIGINT REFERENCES runs(id) ON DELETE SET NULL,
+    status VARCHAR(20) NOT NULL DEFAULT 'active'
+        CHECK (status IN ('active', 'unclaimed')),
+    area_km2 DOUBLE PRECISION NOT NULL,
+    perimeter_km DOUBLE PRECISION NOT NULL,
+    polygon_wkt TEXT NOT NULL,
+    min_lat DOUBLE PRECISION NOT NULL,
+    min_lng DOUBLE PRECISION NOT NULL,
+    max_lat DOUBLE PRECISION NOT NULL,
+    max_lng DOUBLE PRECISION NOT NULL,
+    centroid_lat DOUBLE PRECISION NOT NULL,
+    centroid_lng DOUBLE PRECISION NOT NULL,
+    defense_level INTEGER NOT NULL DEFAULT 1,
+    record_pace_seconds INTEGER,
+    times_defended INTEGER NOT NULL DEFAULT 0,
+    times_challenged INTEGER NOT NULL DEFAULT 0,
+    total_runs INTEGER NOT NULL DEFAULT 1,
+    total_km DOUBLE PRECISION NOT NULL DEFAULT 0,
+    conquered_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    last_defended_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+CREATE INDEX IF NOT EXISTS idx_territories_owner ON territories (owner_id);
+CREATE INDEX IF NOT EXISTS idx_territories_club ON territories (club_id);
+CREATE INDEX IF NOT EXISTS idx_territories_bbox ON territories (min_lat, max_lat, min_lng, max_lng);
+
+-- 8. Challenges
+CREATE TABLE IF NOT EXISTS challenges (
+    id SERIAL PRIMARY KEY,
+    challenge_id VARCHAR(40) NOT NULL UNIQUE,
+    territory_id INTEGER NOT NULL REFERENCES territories(id) ON DELETE CASCADE,
+    challenger_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    status VARCHAR(20) NOT NULL DEFAULT 'active'
+        CHECK (status IN ('active', 'won', 'lost')),
+    target_pace_seconds INTEGER,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    resolved_at TIMESTAMPTZ
+);
+CREATE INDEX IF NOT EXISTS idx_challenges_territory ON challenges (territory_id, challenger_id, status);
+
+-- 9. Achievement catalog + unlocks
+CREATE TABLE IF NOT EXISTS achievements (
+    id SERIAL PRIMARY KEY,
+    key VARCHAR(50) NOT NULL UNIQUE,
+    title VARCHAR(100) NOT NULL,
+    description TEXT NOT NULL,
+    badge_icon VARCHAR(50) NOT NULL DEFAULT 'trophy'
+);
+
+CREATE TABLE IF NOT EXISTS user_achievements (
+    id SERIAL PRIMARY KEY,
+    user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    achievement_id INTEGER NOT NULL REFERENCES achievements(id) ON DELETE CASCADE,
+    unlocked_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    UNIQUE (user_id, achievement_id)
+);

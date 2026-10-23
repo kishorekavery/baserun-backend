@@ -1,6 +1,8 @@
 from datetime import datetime, timezone
 import pytest
 
+from tests.conftest import square_loop
+
 
 def test_live_tracking_coordinates_and_recent_points(client, auth_headers):
     """
@@ -30,7 +32,7 @@ def test_live_tracking_coordinates_and_recent_points(client, auth_headers):
     assert telem_res.json()["saved_points"] == 3
 
     # 3. Live HUD endpoint returns real-time coordinates
-    res_live = client.get(f"/api/v1/runs/{act_id}/live")
+    res_live = client.get(f"/api/v1/runs/{act_id}/live", headers=auth_headers)
     assert res_live.status_code == 200
     live = res_live.json()
     assert live["points_count"] == 3
@@ -41,7 +43,7 @@ def test_live_tracking_coordinates_and_recent_points(client, auth_headers):
     assert live["recent_points"][-1]["latitude"] == 13.0840
 
     # 4. Full path endpoint returns full GPS trail for Flutter map rendering
-    res_path = client.get(f"/api/v1/runs/{act_id}/path")
+    res_path = client.get(f"/api/v1/runs/{act_id}/path", headers=auth_headers)
     assert res_path.status_code == 200
     path_data = res_path.json()
     assert path_data["total_points"] == 3
@@ -50,19 +52,23 @@ def test_live_tracking_coordinates_and_recent_points(client, auth_headers):
     assert path_data["path"][2]["latitude"] == 13.0840
 
 
-def test_territory_nearby_dynamic_distance(client):
+def test_territory_nearby_dynamic_distance(client, auth_headers):
     """
-    Verify nearby territories distance is calculated from real DB polygon centroid using Haversine
+    Verify nearby territories distance is calculated from the stored polygon
     rather than hardcoded values.
     """
-    res = client.get("/api/v1/territories/nearby?lat=13.0827&lng=80.2707&radius_km=10.0")
+    loop = square_loop()
+    client.post("/api/v1/bases/claim", json={"points": loop}, headers=auth_headers)
+    lat, lng = loop[0]["latitude"] - 0.01, loop[0]["longitude"]
+    res = client.get(f"/api/v1/territories/nearby?lat={lat}&lng={lng}&radius_km=10.0")
     assert res.status_code == 200
     data = res.json()
     assert data["total_nearby"] >= 1
     # Check that distance_km is dynamically calculated (not hardcoded 1.2 or 0.8)
     first_terr = data["territories"][0]
     assert isinstance(first_terr["distance_km"], float)
-    assert first_terr["distance_km"] >= 0.0
+    assert 1.0 < first_terr["distance_km"] < 1.2
+    assert first_terr["distance_meters"] == pytest.approx(first_terr["distance_km"] * 1000, abs=10)
 
 
 def test_prevent_double_claim_on_same_run(client, auth_headers):

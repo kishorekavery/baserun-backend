@@ -1,209 +1,134 @@
 import os
 from typing import Optional, Dict, Any
-from urllib.parse import quote_plus
+from urllib.parse import quote_plus, unquote, urlsplit
+
+
+def _first_env(*names: str, default: str = "") -> str:
+    for name in names:
+        value = os.getenv(name)
+        if value:
+            return value
+    return default
+
+
+def _int_env(name: str, default: int) -> int:
+    try:
+        return int(os.getenv(name, str(default)))
+    except ValueError:
+        return default
+
+
+def _float_env(name: str, default: float) -> float:
+    try:
+        return float(os.getenv(name, str(default)))
+    except ValueError:
+        return default
 
 
 class DatabaseConfig:
     """
-    Configuration holder for both local SQLite and External Database connections.
-    Loads settings from environment variables with sensible defaults.
+    PostgreSQL connection settings (Supabase, Neon, RDS, local Postgres, ...).
+    Either DATABASE_URL / EXTERNAL_DATABASE_URL or the discrete
+    EXTERNAL_DB_* (or DB_*) variables are used.
     """
 
     def __init__(
         self,
-        db_type: str = "sqlite",
-        database_path: str = "baserun.db",
-        external_db_type: str = "postgresql",
-        external_host: str = "localhost",
-        external_port: int = 5432,
-        external_name: str = "baserun_db",
-        external_user: str = "postgres",
-        external_password: str = "",
-        external_sslmode: str = "prefer",
-        external_min_connections: int = 1,
-        external_max_connections: int = 10,
-        external_timeout: float = 10.0,
-        external_database_url: Optional[str] = None,
+        host: str = "localhost",
+        port: int = 5432,
+        name: str = "baserun_db",
+        user: str = "postgres",
+        password: str = "",
+        sslmode: str = "prefer",
+        min_connections: int = 1,
+        max_connections: int = 10,
+        timeout: float = 10.0,
+        database_url: Optional[str] = None,
     ):
-        self.db_type = db_type
-        self.database_path = database_path
-
-        # External DB settings
-        self.external_db_type = external_db_type
-        self.external_host = external_host
-        self.external_port = external_port
-        self.external_name = external_name
-        self.external_user = external_user
-        self.external_password = external_password
-        self.external_sslmode = external_sslmode
-        self.external_min_connections = external_min_connections
-        self.external_max_connections = external_max_connections
-        self.external_timeout = external_timeout
-        self.external_database_url = external_database_url
+        self.host = host
+        self.port = port
+        self.name = name
+        self.user = user
+        self.password = password
+        self.sslmode = sslmode
+        self.min_connections = min_connections
+        self.max_connections = max_connections
+        self.timeout = timeout
+        self.database_url = database_url
 
     @classmethod
     def from_env(cls) -> "DatabaseConfig":
-        """
-        Loads database settings from environment variables.
-        Supports both EXTERNAL_DB_* and standard DB_* variable prefixes.
-        """
-        db_type = os.getenv("DATABASE_TYPE", "sqlite").lower()
-        is_serverless = bool(os.getenv("VERCEL") or os.getenv("VERCEL_ENV") or os.getenv("AWS_LAMBDA_FUNCTION_NAME"))
-        default_db_path = "/tmp/baserun.db" if is_serverless else "baserun.db"
-        database_path = os.getenv("DATABASE_PATH", default_db_path)
-
-        external_db_type = (
-            os.getenv("EXTERNAL_DB_TYPE")
-            or os.getenv("DB_TYPE")
-            or "postgresql"
-        ).lower()
-
-        external_host = (
-            os.getenv("EXTERNAL_DB_HOST")
-            or os.getenv("DB_HOST")
-            or "localhost"
-        )
-
-        port_str = (
-            os.getenv("EXTERNAL_DB_PORT")
-            or os.getenv("DB_PORT")
-            or "5432"
-        )
         try:
-            external_port = int(port_str)
+            port = int(_first_env("EXTERNAL_DB_PORT", "DB_PORT", default="5432"))
         except ValueError:
-            external_port = 5432
-
-        external_name = (
-            os.getenv("EXTERNAL_DB_NAME")
-            or os.getenv("DB_NAME")
-            or "baserun_db"
-        )
-
-        external_user = (
-            os.getenv("EXTERNAL_DB_USER")
-            or os.getenv("DB_USER")
-            or "postgres"
-        )
-
-        external_password = (
-            os.getenv("EXTERNAL_DB_PASSWORD")
-            or os.getenv("DB_PASSWORD")
-            or ""
-        )
-
-        external_sslmode = (
-            os.getenv("EXTERNAL_DB_SSLMODE")
-            or os.getenv("DB_SSLMODE")
-            or "prefer"
-        )
-
-        min_conn_str = os.getenv("EXTERNAL_DB_MIN_CONNECTIONS", "1")
-        try:
-            external_min_connections = int(min_conn_str)
-        except ValueError:
-            external_min_connections = 1
-
-        max_conn_str = os.getenv("EXTERNAL_DB_MAX_CONNECTIONS", "10")
-        try:
-            external_max_connections = int(max_conn_str)
-        except ValueError:
-            external_max_connections = 10
-
-        timeout_str = os.getenv("EXTERNAL_DB_TIMEOUT", "10.0")
-        try:
-            external_timeout = float(timeout_str)
-        except ValueError:
-            external_timeout = 10.0
-
-        external_database_url = (
-            os.getenv("EXTERNAL_DATABASE_URL")
-            or os.getenv("DATABASE_URL")
-        )
+            port = 5432
 
         return cls(
-            db_type=db_type,
-            database_path=database_path,
-            external_db_type=external_db_type,
-            external_host=external_host,
-            external_port=external_port,
-            external_name=external_name,
-            external_user=external_user,
-            external_password=external_password,
-            external_sslmode=external_sslmode,
-            external_min_connections=external_min_connections,
-            external_max_connections=external_max_connections,
-            external_timeout=external_timeout,
-            external_database_url=external_database_url,
+            host=_first_env("EXTERNAL_DB_HOST", "DB_HOST", default="localhost"),
+            port=port,
+            name=_first_env("EXTERNAL_DB_NAME", "DB_NAME", default="baserun_db"),
+            user=_first_env("EXTERNAL_DB_USER", "DB_USER", default="postgres"),
+            password=_first_env("EXTERNAL_DB_PASSWORD", "DB_PASSWORD"),
+            sslmode=_first_env("EXTERNAL_DB_SSLMODE", "DB_SSLMODE", default="prefer"),
+            min_connections=_int_env("EXTERNAL_DB_MIN_CONNECTIONS", 1),
+            max_connections=_int_env("EXTERNAL_DB_MAX_CONNECTIONS", 10),
+            timeout=_float_env("EXTERNAL_DB_TIMEOUT", 10.0),
+            database_url=_first_env("DATABASE_URL", "EXTERNAL_DATABASE_URL") or None,
         )
 
-    def is_external_configured(self) -> bool:
+    def get_database_url(self) -> str:
         """
-        Determines if an external database has been configured with valid credentials or URI.
+        Returns the full connection URI, building it from discrete credentials
+        when no DATABASE_URL is set.
         """
-        if self.external_database_url:
-            return True
-        # If user explicitly provided password or changed host from default localhost with credentials
-        if self.external_password and self.external_user:
-            return True
-        return False
+        if self.database_url:
+            # asyncpg only understands the postgresql:// / postgres:// schemes
+            if self.database_url.startswith("postgresql+asyncpg://"):
+                return "postgresql://" + self.database_url[len("postgresql+asyncpg://"):]
+            return self.database_url
 
-    def get_external_database_url(self) -> str:
-        """
-        Returns full connection URI for external database.
-        Constructs URL from discrete credentials if EXTERNAL_DATABASE_URL is not set.
-        """
-        if self.external_database_url:
-            return self.external_database_url
-
-        encoded_user = quote_plus(self.external_user)
-        encoded_pass = quote_plus(self.external_password)
-        auth = f"{encoded_user}:{encoded_pass}" if self.external_password else encoded_user
-
-        query_params = []
-        if self.external_sslmode:
-            query_params.append(f"sslmode={self.external_sslmode}")
-
-        query_string = f"?{'&'.join(query_params)}" if query_params else ""
-
-        return (
-            f"{self.external_db_type}://{auth}@"
-            f"{self.external_host}:{self.external_port}/{self.external_name}{query_string}"
-        )
+        auth = quote_plus(self.user)
+        if self.password:
+            auth = f"{auth}:{quote_plus(self.password)}"
+        query = f"?sslmode={self.sslmode}" if self.sslmode else ""
+        return f"postgresql://{auth}@{self.host}:{self.port}/{self.name}{query}"
 
     def to_dict(self, mask_secrets: bool = True) -> Dict[str, Any]:
         """
-        Returns a dictionary representation of configuration for logging or health checks.
+        Dictionary representation for logging or health checks.
         """
-        pwd = "******" if (mask_secrets and self.external_password) else self.external_password
         masked_url = None
-        if self.external_database_url:
-            if mask_secrets and "@" in self.external_database_url:
+        if self.database_url:
+            masked_url = self.database_url
+            if mask_secrets and "@" in self.database_url:
                 try:
-                    prefix, rest = self.external_database_url.split("@", 1)
+                    prefix, rest = self.database_url.split("@", 1)
                     scheme, user_info = prefix.split("://", 1)
-                    user = user_info.split(":")[0] if ":" in user_info else user_info
-                    masked_url = f"{scheme}://{user}:******@{rest}"
-                except Exception:
+                    masked_url = f"{scheme}://{user_info.split(':')[0]}:******@{rest}"
+                except ValueError:
                     masked_url = "******"
-            else:
-                masked_url = self.external_database_url
+
+        host, port, name, user = self.host, self.port, self.name, self.user
+        if self.database_url:
+            try:
+                parts = urlsplit(self.database_url)
+                host, port = parts.hostname or host, parts.port or port
+                name, user = parts.path.lstrip("/") or name, unquote(parts.username or user)
+            except ValueError:
+                pass
 
         return {
-            "db_type": self.db_type,
-            "database_path": self.database_path,
-            "external_configured": self.is_external_configured(),
-            "external_db_type": self.external_db_type,
-            "external_host": self.external_host,
-            "external_port": self.external_port,
-            "external_name": self.external_name,
-            "external_user": self.external_user,
-            "external_password": pwd,
-            "external_sslmode": self.external_sslmode,
-            "external_min_connections": self.external_min_connections,
-            "external_max_connections": self.external_max_connections,
-            "external_timeout": self.external_timeout,
-            "external_database_url": masked_url,
+            "db_type": "postgresql",
+            "host": host,
+            "port": port,
+            "name": name,
+            "user": user,
+            "password": "******" if (mask_secrets and self.password) else self.password,
+            "sslmode": self.sslmode,
+            "min_connections": self.min_connections,
+            "max_connections": self.max_connections,
+            "timeout": self.timeout,
+            "database_url": masked_url,
         }
 
 

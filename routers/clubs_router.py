@@ -1,202 +1,166 @@
+from typing import Optional
+
 from fastapi import APIRouter, Depends, HTTPException, Query
-from db.db_conn import sqlite_connection, fetch_record, execute_query, execute_query_one
+
+from db.database import connection, transaction
 from models.datamodel import (
     BaseListResponse,
     ClubItem,
-    ClubLeaderboardMember,
     ClubLeaderboardResponse,
     ClubListResponse,
+    ClubMembershipResponse,
 )
-from routers.core import get_current_user
+from routers.core import get_current_user, get_current_user_optional
+from services.club_service import CLUB_STATS_SELECT, club_item, set_user_club
+from services.territory_service import TERRITORY_SELECT, base_item
+from utils.helper import format_pace, pace_seconds_per_km
 
 router = APIRouter(prefix="/api/v1/clubs", tags=["clubs"])
 
 
+async def _viewer_club_id(conn, current_user: Optional[dict], user_id: Optional[int]) -> Optional[int]:
+    if current_user:
+        return current_user["club_id"]
+    if user_id is not None:
+        return await conn.fetchval("SELECT club_id FROM users WHERE id = $1", user_id)
+    return None
+
+
 @router.get("", response_model=ClubListResponse)
 async def list_clubs(
-    user_id: str | None = Query(None, description="Check if user is a member"),
+    user_id: Optional[int] = Query(None, description="Legacy: viewer id when no Bearer token is sent"),
+    current_user: Optional[dict] = Depends(get_current_user_optional),
 ):
     """
-    Screen 11: Clubs Screen - 'Discover' and 'My Club' tabs.
-    Lists clubs like Chennai Runners, Anna Nagar Runners, Marina Striders.
+    Screen 11: clubs ranked by territories held, with live member/territory tallies.
     """
-    conn = await sqlite_connection()
-    try:
-        rows = await execute_query(conn, "SELECT * FROM clubs ORDER BY member_count DESC")
-        clubs = []
-        user_club_id = None
-        if user_id:
-            member_row = await execute_query_one(conn, "SELECT club_id FROM club_members WHERE user_id = ?", (user_id,))
-            if member_row:
-                user_club_id = member_row["club_id"]
-
-        for r in rows:
-            clubs.append(ClubItem(
-                id=r["id"],
-                name=r["name"],
-                description=r["description"],
-                avatar_url=r["avatar_url"],
-                color=r["color"],
-                member_count=r["member_count"],
-                territory_count=r["territory_count"],
-                total_km=round(r["total_km"], 1),
-                is_joined=(r["id"] == user_club_id) if user_club_id else False,
-            ))
-        return {"total": len(clubs), "clubs": clubs}
-    finally:
-        await conn.close()
+    async with connection() as conn:
+        viewer_club_id = await _viewer_club_id(conn, current_user, user_id)
+        rows = await conn.fetch(CLUB_STATS_SELECT + " ORDER BY territory_count DESC, member_count DESC, c.id")
+    clubs = [club_item(r, viewer_club_id) for r in rows]
+    return {"total": len(clubs), "clubs": clubs}
 
 
 @router.get("/{club_id}", response_model=ClubItem)
-async def get_club_details(club_id: int):
-    """
-    Screen 11: Get single club card details.
-    """
-    conn = await sqlite_connection()
-    try:
-        r = await fetch_record(conn, "clubs", "id", (club_id,))
-        if not r:
-            raise HTTPException(status_code=404, detail="Club not found")
-        return ClubItem(
-            id=r["id"],
-            name=r["name"],
-            description=r["description"],
-            avatar_url=r["avatar_url"],
-            color=r["color"],
-            member_count=r["member_count"],
-            territory_count=r["territory_count"],
-            total_km=round(r["total_km"], 1),
-            is_joined=True,
-        )
-    finally:
-        await conn.close()
-
-
-@router.post("/{club_id}/join")
-async def join_club(
+async def get_club_details(
     club_id: int,
-    user_id: str | None = Query(None),
-    current_user: dict = Depends(get_current_user),
+    user_id: Optional[int] = Query(None, description="Legacy: viewer id when no Bearer token is sent"),
+    current_user: Optional[dict] = Depends(get_current_user_optional),
 ):
     """
-    Screen 11: 'Join' club button.
+    Screen 11: single club card.
     """
-    actual_user_id = str(current_user["id"])
-    conn = await sqlite_connection()
-    try:
-        club = await fetch_record(conn, "clubs", "id", (club_id,))
-        if not club:
+    async with connection() as conn:
+        viewer_club_id = await _viewer_club_id(conn, current_user, user_id)
+        row = await conn.fetchrow(CLUB_STATS_SELECT + " WHERE c.id = $1", club_id)
+    if not row:
+        raise HTTPException(status_code=404, detail="Club not found")
+    return club_item(row, viewer_club_id)
+
+
+@router.post("/{club_id}/join", response_model=ClubMembershipResponse)
+async def join_club(club_id: int, current_user: dict = Depends(get_current_user)):
+    """
+    Screen 11: join or switch club. Your active territories move with you.
+    """
+    async with transaction() as conn:
+        club_name = await conn.fetchval("SELECT name FROM clubs WHERE id = $1", club_id)
+        if club_name is None:
             raise HTTPException(status_code=404, detail="Club not found")
-
-        # Upsert club membership
-        await conn.execute("""
-            INSERT INTO club_members (club_id, user_id, role)
-            VALUES (?, ?, 'member')
-            ON CONFLICT(club_id, user_id) DO NOTHING
-        """, (club_id, actual_user_id))
-
-        await conn.execute("UPDATE users SET club_id = ? WHERE id = ?", (club_id, int(actual_user_id) if actual_user_id.isdigit() else 1))
-        await conn.execute("UPDATE clubs SET member_count = member_count + 1 WHERE id = ?", (club_id,))
-        await conn.commit()
+        transferred = await set_user_club(conn, current_user["id"], club_id)
+    return {
+        "status": "success",
+        "message": f"Successfully joined {club_name}!",
+        "club_id": club_id,
+        "club_name": club_name,
+        "territories_transferred": transferred,
+    }
 
 
-        return {"status": "success", "message": f"Successfully joined {club['name']}!"}
-    finally:
-        await conn.close()
+@router.post("/{club_id}/leave", response_model=ClubMembershipResponse)
+async def leave_club(club_id: int, current_user: dict = Depends(get_current_user)):
+    """
+    Screen 11: leave your club and run as a "Solo Rogue".
+    """
+    if current_user["club_id"] != club_id:
+        raise HTTPException(status_code=400, detail="You are not a member of this club")
+    async with transaction() as conn:
+        transferred = await set_user_club(conn, current_user["id"], None)
+    return {
+        "status": "success",
+        "message": "You left the club",
+        "club_id": None,
+        "club_name": None,
+        "territories_transferred": transferred,
+    }
 
 
 @router.get("/{club_id}/leaderboard", response_model=ClubLeaderboardResponse)
 async def get_club_leaderboard(
     club_id: int,
-    current_user_id: str = Query("1"),
+    limit: int = Query(50, ge=1, le=200),
+    current_user_id: Optional[int] = Query(None, description="Legacy: viewer id when no Bearer token is sent"),
+    current_user: Optional[dict] = Depends(get_current_user_optional),
 ):
     """
-    Screen 11: Club Leaderboard (Top contributors table)
-    Ranks members by territories claimed and total KM:
-    #1 runvicky (8 Territories | 120.4 KM)
-    #2 priya_r (6 Territories | 98.7 KM)
-    #3 adventurer99 (5 Territories | 76.2 KM)
-    #4 karthik (4 Territories | 62.1 KM)
-    #5 meena.run (4 Territories | 58.3 KM)
+    Screen 11: club members ranked by bases held, then kilometres run.
     """
-    conn = await sqlite_connection()
-    try:
-        club = await fetch_record(conn, "clubs", "id", (club_id,))
+    viewer_id = current_user["id"] if current_user else current_user_id
+    async with connection() as conn:
+        club = await conn.fetchrow(CLUB_STATS_SELECT + " WHERE c.id = $1", club_id)
         if not club:
             raise HTTPException(status_code=404, detail="Club not found")
-
-        member_rows = await execute_query(
-            conn,
+        rows = await conn.fetch(
             """
-            SELECT 
-                u.id as user_id,
-                u.username,
-                u.avatar_url,
-                cm.territories_contributed,
-                cm.km_contributed,
-                (SELECT count(*) FROM claimed_bases cb WHERE cb.user_id = u.id AND cb.status = 'active') as active_territories,
-                (SELECT COALESCE(SUM(r.distance_km), 0.0) FROM runs r WHERE r.user_id = u.id) as active_km
-            FROM club_members cm
-            JOIN users u ON cm.user_id = u.id
-            WHERE cm.club_id = ?
-            ORDER BY (cm.territories_contributed + (SELECT count(*) FROM claimed_bases cb WHERE cb.user_id = u.id AND cb.status = 'active')) DESC,
-                     (cm.km_contributed + (SELECT COALESCE(SUM(r.distance_km), 0.0) FROM runs r WHERE r.user_id = u.id)) DESC
-            LIMIT 5
+            SELECT u.id, u.username, u.avatar_url,
+                   (SELECT count(*) FROM territories t
+                     WHERE t.owner_id = u.id AND t.club_id = $1 AND t.status = 'active') AS territories_held,
+                   COALESCE(rs.total_km, 0) AS total_km,
+                   COALESCE(rs.total_seconds, 0) AS total_seconds
+            FROM users u
+            LEFT JOIN (
+                SELECT user_id, SUM(distance_km) AS total_km, SUM(duration_seconds) AS total_seconds
+                FROM runs WHERE status = 'completed' GROUP BY user_id
+            ) rs ON rs.user_id = u.id
+            WHERE u.club_id = $1 AND u.is_active
+            ORDER BY territories_held DESC, total_km DESC, u.id
+            LIMIT $2
             """,
-            (club_id,),
+            club_id, limit,
         )
 
-        members = []
-        for idx, r in enumerate(member_rows):
-            tot_terrs = (r["territories_contributed"] or 0) + (r["active_territories"] or 0)
-            tot_km = round((r["km_contributed"] or 0.0) + (r["active_km"] or 0.0), 1)
-            is_curr = str(r["user_id"]) == str(current_user_id)
-            members.append(ClubLeaderboardMember(
-                rank=idx + 1,
-                user_id=str(r["user_id"]),
-                username=r["username"],
-                avatar_url=r["avatar_url"] or "",
-                territories=tot_terrs,
-                total_km=tot_km,
-                is_current_user=is_curr,
-            ))
-
-        total_members_row = await execute_query_one(
-            conn, "SELECT count(*) as cnt FROM club_members WHERE club_id = ?", (club_id,)
-        )
-        total_members = total_members_row["cnt"] if total_members_row else club["member_count"]
-
-        total_terrs_row = await execute_query_one(
-            conn, "SELECT count(*) as cnt FROM claimed_bases WHERE club_id = ? AND status = 'active'", (club_id,)
-        )
-        total_terrs = total_terrs_row["cnt"] if total_terrs_row else club["territory_count"]
-
-        return {
-            "club_id": club["id"],
-            "club_name": club["name"],
-            "total_members": total_members,
-            "total_territories": total_terrs,
-            "leaderboard": members,
-        }
-    finally:
-        await conn.close()
+    leaderboard = []
+    for rank, r in enumerate(rows, start=1):
+        avatar = r["avatar_url"] or ""
+        leaderboard.append({
+            "rank": rank,
+            "user_id": str(r["id"]),
+            "username": r["username"],
+            "runner_name": r["username"],
+            "avatar_url": avatar,
+            "runner_avatar": avatar,
+            "territories": r["territories_held"],
+            "territories_held": r["territories_held"],
+            "total_km": round(r["total_km"], 1),
+            "avg_pace": format_pace(pace_seconds_per_km(r["total_seconds"], r["total_km"])),
+            "is_current_user": viewer_id is not None and r["id"] == viewer_id,
+        })
+    return {
+        "club_id": club["id"],
+        "club_name": club["name"],
+        "total_members": club["member_count"],
+        "total_territories": club["territory_count"],
+        "leaderboard": leaderboard,
+    }
 
 
 @router.get("/{club_id}/territories", response_model=BaseListResponse)
 async def get_club_territories(club_id: int):
     """
-    Screen 11: Club territories tab.
+    Screen 11: active territories held by a club.
     """
-    conn = await sqlite_connection()
-    try:
-        rows = await execute_query(
-            conn,
-            "SELECT * FROM claimed_bases WHERE club_id = ? AND status = 'active' ORDER BY id DESC",
-            (club_id,),
+    async with connection() as conn:
+        rows = await conn.fetch(
+            TERRITORY_SELECT + " WHERE t.club_id = $1 AND t.status = 'active' ORDER BY t.id DESC", club_id
         )
-        return {
-            "total": len(rows),
-            "bases": [dict(r) for r in rows],
-        }
-    finally:
-        await conn.close()
+    return {"total": len(rows), "bases": [base_item(r) for r in rows]}

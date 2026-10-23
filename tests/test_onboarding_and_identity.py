@@ -1,14 +1,20 @@
 import uuid
 
+from tests.conftest import square_loop
+
 
 def test_screen_1_splash_config(client):
     """Screen 1: Splash Screen API"""
     res = client.get("/api/v1/app/config")
     assert res.status_code == 200
     data = res.json()
-    assert data["app_name"] == "Run to Claim"
-    assert "YOUR RUN" in data["tagline"]
-    assert "Coastal Turf Wars" in data["active_season"]
+    assert data["app_name"] == "BASER"
+    assert data["tagline"] == "Turn Your Miles into Territory"
+    assert data["current_season"] == "Season 1: Chennai Conquest"
+    assert data["active_season"] == data["current_season"]
+    assert data["maintenance_mode"] is False
+    assert data["min_version"] == "1.0.0"
+    assert data["server_time"].endswith("Z")
 
 
 def test_screen_2_social_login_google(client):
@@ -63,10 +69,10 @@ def test_screen_4_color_palette(client):
     res = client.get("/api/v1/app/color-palette")
     assert res.status_code == 200
     data = res.json()
-    assert len(data["colors"]) == 10
     hex_list = [c["hex"] for c in data["colors"]]
-    assert "#00E5FF" in hex_list  # Neon Cyan
-    assert "#E91E63" in hex_list  # Electric Magenta
+    assert "#00E5FF" in hex_list  # Electric Cyan
+    assert "#FF007F" in hex_list  # Hot Magenta
+    assert any(c["is_premium"] for c in data["colors"])
 
 
 def test_screen_4_update_identity(client, auth_headers):
@@ -82,9 +88,12 @@ def test_screen_4_update_identity(client, auth_headers):
     assert "Identity updated" in data["message"]
 
 
-def test_screen_5_location_permission_nearby(client):
+def test_screen_5_location_permission_nearby(client, auth_headers):
     """Screen 5: Location Permission - Preview nearby territories"""
-    res = client.get("/api/v1/territories/nearby?lat=13.0827&lng=80.2707&radius_km=5.0")
+    loop = square_loop()
+    client.post("/api/v1/bases/claim", json={"points": loop}, headers=auth_headers)
+    lat, lng = loop[0]["latitude"], loop[0]["longitude"]
+    res = client.get(f"/api/v1/territories/nearby?lat={lat}&lng={lng}&radius_km=5.0")
     assert res.status_code == 200
     data = res.json()
     assert data["total_nearby"] >= 1

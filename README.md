@@ -1,7 +1,7 @@
 # Run to Claim — Backend API & Architecture
 
 > **Your Run. Your Territory. A Bigger World.**
-> A gamified running backend engine built with FastAPI, SQLite/PostgreSQL, Shapely, and Pyproj for GPS tracking, geodesic territory claiming, running clubs, and leaderboard competitions.
+> A gamified running backend engine built with FastAPI, PostgreSQL (asyncpg), Shapely, and Pyproj for GPS tracking, geodesic territory claiming, running clubs, and leaderboard competitions.
 
 ---
 
@@ -321,36 +321,46 @@ flowchart TD
 
 ## Database Architecture
 
-The SQLite schema supports all entities with primary keys, indexes, and foreign keys:
+PostgreSQL is the only datastore (Supabase, Neon, RDS or a local server all work). The schema in
+`db/schema.sql` is applied automatically on startup / first request (idempotent; set
+`DB_AUTO_MIGRATE=false` to apply it yourself). Geometry is computed in Python with Shapely + pyproj
+geodesics and stored as WKT plus a bounding box, so PostGIS is not required.
 
-1. `users` — Authentication credentials, `@username`, territory color, avatar, city, and club ID.
-2. `runs` — Running activity sessions, duration, distance, steps, calories, elevation, and status.
-3. `telemetry_points` — High-resolution GPS breadcrumb points with altitude, speed, and accuracy.
-4. `claimed_bases` — Geodesic polygon territories in Well-Known Text (`POLYGON (...)`), area, perimeter, and ownership.
-5. `clubs` & `club_members` — Running communities ("Chennai Runners", "Anna Nagar Runners") and member rankings.
-6. `achievements` — Badges and trophies unlocked by claiming territories and achieving distance milestones.
+1. `users` — credentials, case-insensitive unique `username`/`email`, territory color, avatar, bio, club.
+2. `sessions` — server-side JWT sessions (revocation, idle/absolute expiry).
+3. `runs` — activity sessions: status (`recording` / `paused` / `completed`), pause bookkeeping, distance, pace, loop closure.
+4. `telemetry_points` — GPS breadcrumbs (accuracy > 30 m and speed > 100 km/h are dropped).
+5. `territories` — claimed bases: WKT polygon, bbox, area/perimeter, defense level, record pace.
+6. `challenges` — challenge intents and their outcome.
+7. `clubs` — running clubs; member/territory/area totals are aggregated live.
+8. `achievements` / `user_achievements` — badge catalog and unlocks.
+9. `seasons` — current season shown on the splash screen.
+
+A database created by the old code base is not modified destructively: its tables are renamed to
+`legacy_<name>` the first time the new schema is applied.
+
+---
+
+## Configuration
+
+Copy `.env.example` to `.env` and set either `DATABASE_URL` or the `EXTERNAL_DB_*` variables, plus
+`JWT_SECRET_KEY`. For Google/Apple sign-in set `GOOGLE_CLIENT_IDS` / `APPLE_CLIENT_IDS`; the app must send
+the provider **ID token** (`id_token` / Apple `identityToken`) to `/auth/social-login`.
+
+```bash
+python scripts/check_db.py        # connectivity + row counts
+python scripts/seed_demo_data.py  # optional demo runners and territories
+```
 
 ---
 
 ## Running the Automated Test Suite
 
-The test suite covers 100% of the screen flows across **41 unit and integration tests**:
+Tests need a disposable PostgreSQL database (its name must contain `test`; the schema is reset):
 
 ```bash
-# Run all tests using pytest
-PYTHONPATH=. ./.venv/bin/pytest -v tests
-```
-
-### Test Results
-```text
-tests/test_onboarding_and_identity.py ........                           [ 20%]
-tests/test_active_run_tracking.py ....                                   [ 29%]
-tests/test_turf_conquest_and_clubs.py ....                               [ 39%]
-tests/test_auth.py .........................                             [ 68%]
-tests/test_bases.py .................                                    [ 90%]
-tests/test_telemetry.py .....                                            [100%]
-
-======================== 41 passed in 1.39s =========================
+createdb baserun_test
+TEST_DATABASE_URL=postgresql://postgres@localhost:5432/baserun_test ./.venv/bin/pytest
 ```
 
 ---

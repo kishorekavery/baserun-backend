@@ -1,10 +1,16 @@
 from datetime import datetime, timezone
 import uuid
 
+from tests.conftest import square_loop
 
-def test_screen_6_home_map(client):
+
+def test_screen_6_home_map(client, auth_headers):
     """Screen 6: Home Map - View colored territories and ready to run card"""
-    res = client.get("/api/v1/map/home?user_id=1")
+    loop = square_loop()
+    client.post("/api/v1/bases/claim", json={"points": loop}, headers=auth_headers)
+    res = client.get(
+        f"/api/v1/map/home?lat={loop[0]['latitude']}&lng={loop[0]['longitude']}", headers=auth_headers
+    )
     assert res.status_code == 200
     data = res.json()
     assert "active_runners_nearby" in data
@@ -20,7 +26,7 @@ def test_screen_6_start_run(client, auth_headers):
     }, headers=auth_headers)
     assert res.status_code == 200
     data = res.json()
-    assert data["status"] == "in_progress"
+    assert data["status"] == "recording"
     assert "activity_id" in data
     assert data["title"] == "Marina Beach Loop"
 
@@ -45,10 +51,10 @@ def test_screen_7_run_in_progress_flow(client, auth_headers):
     assert res_telem.json()["saved_points"] == 3
 
     # 3. Live HUD stats
-    res_live = client.get(f"/api/v1/runs/{act_id}/live")
+    res_live = client.get(f"/api/v1/runs/{act_id}/live", headers=auth_headers)
     assert res_live.status_code == 200
     live_data = res_live.json()
-    assert live_data["status"] == "in_progress"
+    assert live_data["status"] == "recording"
     assert "distance_km" in live_data
     assert "duration_formatted" in live_data
     assert "pace_formatted" in live_data
@@ -61,7 +67,7 @@ def test_screen_7_run_in_progress_flow(client, auth_headers):
     # 5. Resume run
     res_resume = client.post(f"/api/v1/runs/{act_id}/resume", headers=auth_headers)
     assert res_resume.status_code == 200
-    assert res_resume.json()["status"] == "in_progress"
+    assert res_resume.json()["status"] == "recording"
 
 
 def test_screen_8_run_summary_finish(client, auth_headers):
@@ -87,6 +93,6 @@ def test_screen_8_run_summary_finish(client, auth_headers):
     assert summary["title"] == "Marina Beach Loop"
 
     # 3. Get summary card
-    res_get = client.get(f"/api/v1/runs/{act_id}/summary")
+    res_get = client.get(f"/api/v1/runs/{act_id}/summary", headers=auth_headers)
     assert res_get.status_code == 200
     assert res_get.json()["steps"] == 6982

@@ -5,6 +5,8 @@ import jwt
 import pytest
 from fastapi.testclient import TestClient
 
+from tests.conftest import db_run
+
 SECRET_KEY = os.getenv("JWT_SECRET_KEY", "test-secret-key-for-pytest-runs-32bytes-minimum")
 ALGORITHM = "HS256"
 
@@ -69,19 +71,8 @@ def test_phase3_expired_db_session_rejected(client: TestClient, test_user):
     token = test_user["token"]
     session_id = test_user["session_id"]
 
-    import asyncio
-    from db.db_conn import sqlite_connection
-
-    async def expire_session():
-        conn = await sqlite_connection()
-        try:
-            past_time = (datetime.now(timezone.utc) - timedelta(hours=2)).isoformat()
-            await conn.execute("UPDATE sessions SET expires_at = ? WHERE session_id = ?", (past_time, session_id))
-            await conn.commit()
-        finally:
-            await conn.close()
-
-    asyncio.run(expire_session())
+    past_time = datetime.now(timezone.utc) - timedelta(hours=2)
+    db_run("UPDATE sessions SET expires_at = $1 WHERE session_id = $2", past_time, session_id)
 
     res = client.get("/api/v1/bases/me", headers={"Authorization": f"Bearer {token}"})
     assert res.status_code == 401, f"Expected 401 for expired DB session, got {res.status_code}"
@@ -95,18 +86,7 @@ def test_phase3_revoked_session_rejected(client: TestClient, test_user):
     token = test_user["token"]
     session_id = test_user["session_id"]
 
-    import asyncio
-    from db.db_conn import sqlite_connection
-
-    async def revoke_session():
-        conn = await sqlite_connection()
-        try:
-            await conn.execute("UPDATE sessions SET is_revoked = 1 WHERE session_id = ?", (session_id,))
-            await conn.commit()
-        finally:
-            await conn.close()
-
-    asyncio.run(revoke_session())
+    db_run("UPDATE sessions SET is_revoked = TRUE WHERE session_id = $1", session_id)
 
     res = client.get("/api/v1/bases/me", headers={"Authorization": f"Bearer {token}"})
     assert res.status_code == 401

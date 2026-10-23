@@ -113,7 +113,7 @@ def test_get_activity_telemetry_success(client, auth_headers):
     client.post("/api/v1/bases/telemetry", json=post_payload, headers=auth_headers)
 
     # Fetch recorded telemetry for this activity
-    res = client.get(f"/api/v1/bases/telemetry/{activity_id}")
+    res = client.get(f"/api/v1/bases/telemetry/{activity_id}", headers=auth_headers)
     assert res.status_code == 200
     data = res.json()
     assert data["activity_id"] == activity_id
@@ -122,7 +122,12 @@ def test_get_activity_telemetry_success(client, auth_headers):
     assert data["points"][0]["latitude"] == 13.0827
 
 
-def test_get_activity_telemetry_not_found(client):
+def test_get_activity_telemetry_requires_auth(client):
+    res = client.get(f"/api/v1/bases/telemetry/{uuid.uuid4()}")
+    assert res.status_code == 401
+
+
+def test_get_activity_telemetry_not_found(client, auth_headers):
     random_id = str(uuid.uuid4())
-    res = client.get(f"/api/v1/bases/telemetry/{random_id}")
+    res = client.get(f"/api/v1/bases/telemetry/{random_id}", headers=auth_headers)
     assert res.status_code == 404

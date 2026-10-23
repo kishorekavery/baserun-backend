@@ -1,8 +1,12 @@
-from datetime import datetime, timedelta, timezone
+import hashlib
+import logging
+import re
 import secrets
-import uuid
+
+import asyncpg
 from fastapi import APIRouter, Depends, HTTPException, Query
-from db.db_conn import sqlite_connection, fetch_record, insert_records, insert_record_get_id
+
+from db.database import connection
 from models.datamodel import (
     CheckUsernameResponse,
     LoginRequest,
@@ -13,17 +17,23 @@ from models.datamodel import (
     RegisterResponse,
     SocialLoginRequest,
 )
-from routers.core import create_access_token, password_hash, get_current_user, create_user_session
+from routers import core
+from routers.core import build_auth_response, get_current_user, hash_password
+from utils.helper import is_valid_username
+from utils.social_auth import SocialAuthError, allow_unverified, verify_social_token
+
+logger = logging.getLogger("baserun.auth")
 
 router = APIRouter(prefix="/auth", tags=["auth"])
+
+SUPPORTED_PROVIDERS = {"google", "apple"}
 
 
 @router.post("/login", response_model=LoginResponse)
 async def auth_login(request: LoginRequest):
     """
-    Flutter Login Endpoint: POST /auth/login
+    Flutter Login Endpoint: POST /auth/login (username or email in `username`).
     """
-    from routers import core
     return await core.login(request)
 
 
@@ -32,7 +42,6 @@ async def auth_register(request: RegisterRequest):
     """
     Flutter Register Endpoint: POST /auth/register
     """
-    from routers import core
     return await core.register_user(request)
 
 
@@ -42,78 +51,81 @@ async def auth_logout(current_user: dict = Depends(get_current_user)):
     Flutter Logout Endpoint: POST /auth/logout
     Invalidates current session on the server.
     """
-    from routers import core
     return await core.logout(current_user)
 
 
 @router.get("/check-username", response_model=CheckUsernameResponse)
-async def check_username(username: str = Query(..., min_length=3, max_length=32)):
+async def check_username(username: str = Query(..., min_length=1, max_length=64)):
     """
-    Screen 3: Register - Real-time username availability check.
-    Shows the green checkmark on Screen 3 & 4.
+    Screen 3: real-time, case-insensitive username availability check.
     """
-    conn = await sqlite_connection()
-    try:
-        user = await fetch_record(conn, "users", "username", (username,))
-        if user:
-            return {
-                "username": username,
-                "available": False,
-                "message": "Username is already taken"
-            }
+    username = username.strip()
+    if not is_valid_username(username):
         return {
             "username": username,
-            "available": True,
-            "message": "Username is available"
+            "available": False,
+            "message": "Username must be 3-32 characters of letters, numbers, '_', '.' or '-'",
         }
-    finally:
-        await conn.close()
+    async with connection() as conn:
+        taken = await conn.fetchval(
+            "SELECT EXISTS (SELECT 1 FROM users WHERE LOWER(username) = LOWER($1))", username
+        )
+    if taken:
+        return {"username": username, "available": False, "message": "Username is already taken"}
+    return {"username": username, "available": True, "message": "Username is available"}
+
+
+def _username_base(name: str | None, provider: str) -> str:
+    base = re.sub(r"[^a-z0-9_.-]", "", (name or "").lower().replace(" ", "_"))[:24]
+    return base if len(base) >= 3 else f"runner_{provider}"
 
 
 @router.post("/social-login", response_model=LoginResponse)
 async def social_login(request: SocialLoginRequest):
     """
-    Screen 2: Login - Continue with Google or Continue with Apple.
-    Authenticates existing social user or creates a seamless runner account.
+    Screen 2: Continue with Google / Apple. The provider ID token is verified
+    and the account is found (or created) by the verified email.
     """
-    if request.provider.lower() not in ["google", "apple"]:
+    if request.provider not in SUPPORTED_PROVIDERS:
         raise HTTPException(status_code=400, detail="Unsupported social provider")
 
-    email = request.email or f"{request.provider.lower()}_{uuid.uuid4().hex[:8]}@social.baserun.com"
-    base_username = (request.name or f"runner_{request.provider.lower()}").replace(" ", "").lower()
-    username = base_username
+    if allow_unverified():
+        token_hash = hashlib.sha256(request.token.encode()).hexdigest()[:16]
+        email = request.email or f"{request.provider}_{token_hash}@social.baserun.app"
+        name = request.name
+    else:
+        try:
+            identity = await verify_social_token(request.provider, request.token)
+        except SocialAuthError as exc:
+            raise HTTPException(status_code=401, detail=str(exc))
+        email = identity.email or f"{request.provider}_{identity.subject}@social.baserun.app"
+        name = identity.name or request.name
+    email = email.lower()
 
-    conn = await sqlite_connection()
-    try:
-        user = await fetch_record(conn, "users", "email", (email,))
-        if not user:
-            # Check if desired username already exists, if so append random suffix
-            existing_by_uname = await fetch_record(conn, "users", "username", (username,))
-            if existing_by_uname:
-                username = f"{base_username}_{uuid.uuid4().hex[:6]}"
-
-            # Create user on first social login
-            random_pw = password_hash.hash(uuid.uuid4().hex)
-            user_id = await insert_record_get_id(
-                conn,
-                "users",
-                ["username", "hashed_password", "first_name", "last_name", "email", "phone"],
-                [username, random_pw, request.name or "Runner", "", email, ""],
-            )
-        else:
-            user_id = user["id"]
-
-        session_id, token, expires_in, expire_iso = await create_user_session(conn, user_id)
-
-        return {
-            "access_token": token,
-            "token": token,
-            "token_type": "bearer",
-            "message": Message.LOGIN_SUCCESSFUL,
-            "expires_in": expires_in,
-            "expires_at": expire_iso,
-            "session_id": session_id,
-        }
-    finally:
-        await conn.close()
-
+    async with connection() as conn:
+        user_id = await conn.fetchval("SELECT id FROM users WHERE LOWER(email) = $1", email)
+        is_new = user_id is None
+        if is_new:
+            base = _username_base(name, request.provider)
+            random_password = await hash_password(secrets.token_hex(32))
+            for attempt in range(6):
+                username = base if attempt == 0 else f"{base[:24]}_{secrets.token_hex(3)}"
+                try:
+                    user_id = await conn.fetchval(
+                        """
+                        INSERT INTO users (username, email, hashed_password, first_name, last_name, auth_provider)
+                        VALUES ($1, $2, $3, $4, '', $5)
+                        RETURNING id
+                        """,
+                        username, email, random_password, (name or "Runner")[:64], request.provider,
+                    )
+                    break
+                except asyncpg.UniqueViolationError as exc:
+                    if "email" in (exc.constraint_name or ""):
+                        # Created concurrently by another login request
+                        user_id = await conn.fetchval("SELECT id FROM users WHERE LOWER(email) = $1", email)
+                        is_new = False
+                        break
+            if user_id is None:
+                raise HTTPException(status_code=409, detail="Could not allocate a unique username, please retry")
+        return await build_auth_response(conn, user_id, Message.LOGIN_SUCCESSFUL, is_new_user=is_new)

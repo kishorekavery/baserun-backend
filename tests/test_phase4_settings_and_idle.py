@@ -3,7 +3,7 @@ import uuid
 from datetime import datetime, timedelta, timezone
 import pytest
 from fastapi.testclient import TestClient
-from db.db_conn import sqlite_connection
+from tests.conftest import db_run
 
 
 def test_phase4_settings_exist_and_legacy_gone():
@@ -27,18 +27,15 @@ def test_phase4_settings_exist_and_legacy_gone():
     assert not hasattr(core, "ACCESS_TOKEN_MINUTES"), "ACCESS_TOKEN_MINUTES should be completely removed"
 
 
-@pytest.mark.asyncio
-async def test_phase4_sessions_table_has_last_seen_at():
+def test_phase4_sessions_table_has_last_seen_at(client):
     """
     Verify the sessions table in database contains last_seen_at column.
     """
-    conn = await sqlite_connection()
-    try:
-        async with conn.execute("PRAGMA table_info(sessions)") as cur:
-            columns = [row[1] for row in await cur.fetchall()]
-            assert "last_seen_at" in columns, f"last_seen_at column missing from sessions. Found columns: {columns}"
-    finally:
-        await conn.close()
+    rows = db_run(
+        "SELECT column_name FROM information_schema.columns WHERE table_name = 'sessions'", fetch="fetch"
+    )
+    columns = [r["column_name"] for r in rows]
+    assert "last_seen_at" in columns, f"last_seen_at column missing from sessions. Found columns: {columns}"
 
 
 def test_phase4_idle_mode_extends_expires_at(client: TestClient, monkeypatch):
@@ -61,36 +58,22 @@ def test_phase4_idle_mode_extends_expires_at(client: TestClient, monkeypatch):
     session_id = res.json()["session_id"]
     headers = {"Authorization": f"Bearer {token}"}
 
-    import asyncio
-    async def get_session_times():
-        conn = await sqlite_connection()
-        try:
-            async with conn.execute("SELECT expires_at, last_seen_at FROM sessions WHERE session_id = ?", (session_id,)) as cur:
-                return await cur.fetchone()
-        finally:
-            await conn.close()
+    def get_session_times():
+        return db_run("SELECT expires_at, last_seen_at FROM sessions WHERE session_id = $1", session_id, fetch="fetchrow")
 
-    initial_row = asyncio.run(get_session_times())
+    initial_row = get_session_times()
     initial_expires_at = initial_row[0]
 
     # Simulate 6 minutes passing by setting last_seen_at to 6 minutes ago in DB
-    async def set_past_last_seen():
-        conn = await sqlite_connection()
-        try:
-            six_mins_ago = (datetime.now(timezone.utc) - timedelta(minutes=6)).isoformat()
-            await conn.execute("UPDATE sessions SET last_seen_at = ? WHERE session_id = ?", (six_mins_ago, session_id))
-            await conn.commit()
-        finally:
-            await conn.close()
-
-    asyncio.run(set_past_last_seen())
+    six_mins_ago = datetime.now(timezone.utc) - timedelta(minutes=6)
+    db_run("UPDATE sessions SET last_seen_at = $1 WHERE session_id = $2", six_mins_ago, session_id)
 
     # Make a protected request
     res_req = client.get("/api/v1/bases/me", headers=headers)
     assert res_req.status_code == 200
 
     # Verify expires_at moved forward
-    updated_row = asyncio.run(get_session_times())
+    updated_row = get_session_times()
     updated_expires_at = updated_row[0]
     assert updated_expires_at > initial_expires_at, "expires_at should have moved forward in idle mode after 5 minutes"
 
@@ -114,34 +97,20 @@ def test_phase4_absolute_mode_leaves_expires_at_fixed(client: TestClient, monkey
     session_id = res.json()["session_id"]
     headers = {"Authorization": f"Bearer {token}"}
 
-    import asyncio
-    async def get_session_times():
-        conn = await sqlite_connection()
-        try:
-            async with conn.execute("SELECT expires_at FROM sessions WHERE session_id = ?", (session_id,)) as cur:
-                return await cur.fetchone()
-        finally:
-            await conn.close()
+    def get_session_times():
+        return db_run("SELECT expires_at FROM sessions WHERE session_id = $1", session_id, fetch="fetchrow")
 
-    initial_row = asyncio.run(get_session_times())
+    initial_row = get_session_times()
     initial_expires_at = initial_row[0]
 
     # Set last_seen_at to 6 minutes ago
-    async def set_past_last_seen():
-        conn = await sqlite_connection()
-        try:
-            six_mins_ago = (datetime.now(timezone.utc) - timedelta(minutes=6)).isoformat()
-            await conn.execute("UPDATE sessions SET last_seen_at = ? WHERE session_id = ?", (six_mins_ago, session_id))
-            await conn.commit()
-        finally:
-            await conn.close()
-
-    asyncio.run(set_past_last_seen())
+    six_mins_ago = datetime.now(timezone.utc) - timedelta(minutes=6)
+    db_run("UPDATE sessions SET last_seen_at = $1 WHERE session_id = $2", six_mins_ago, session_id)
 
     res_req = client.get("/api/v1/bases/me", headers=headers)
     assert res_req.status_code == 200
 
-    updated_row = asyncio.run(get_session_times())
+    updated_row = get_session_times()
     updated_expires_at = updated_row[0]
     assert updated_expires_at == initial_expires_at, "expires_at must stay fixed in absolute mode"
 

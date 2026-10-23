@@ -1,5 +1,4 @@
-from datetime import datetime, timezone
-import uuid
+from tests.conftest import register, square_loop
 
 
 def test_screen_9_claim_territory_from_run(client, auth_headers):
@@ -11,13 +10,7 @@ def test_screen_9_claim_territory_from_run(client, auth_headers):
     # Stream loop coordinates
     client.post(f"/api/v1/runs/{act_id}/telemetry", json={
         "activity_id": act_id,
-        "points": [
-            {"latitude": 13.0827, "longitude": 80.2707, "timestamp": datetime.now(timezone.utc).isoformat()},
-            {"latitude": 13.0837, "longitude": 80.2707, "timestamp": datetime.now(timezone.utc).isoformat()},
-            {"latitude": 13.0837, "longitude": 80.2717, "timestamp": datetime.now(timezone.utc).isoformat()},
-            {"latitude": 13.0827, "longitude": 80.2717, "timestamp": datetime.now(timezone.utc).isoformat()},
-            {"latitude": 13.0827, "longitude": 80.2707, "timestamp": datetime.now(timezone.utc).isoformat()},
-        ]
+        "points": square_loop(),
     }, headers=auth_headers)
     client.post(f"/api/v1/runs/{act_id}/finish", json={"steps": 6982, "calories": 412}, headers=auth_headers)
 
@@ -39,15 +32,8 @@ def test_screen_9_claim_territory_from_run(client, auth_headers):
 def test_screen_10_territory_details_and_challenge(client, auth_headers):
     """Screen 10: Territory Details and Challenge button"""
     # 0. Ensure at least one claimed base exists
-    base_res = client.post("/api/v1/bases/claim", json={
-        "points": [
-            {"latitude": 13.0820, "longitude": 80.2700, "timestamp": datetime.now(timezone.utc).isoformat()},
-            {"latitude": 13.0830, "longitude": 80.2700, "timestamp": datetime.now(timezone.utc).isoformat()},
-            {"latitude": 13.0830, "longitude": 80.2710, "timestamp": datetime.now(timezone.utc).isoformat()},
-            {"latitude": 13.0820, "longitude": 80.2710, "timestamp": datetime.now(timezone.utc).isoformat()},
-            {"latitude": 13.0820, "longitude": 80.2700, "timestamp": datetime.now(timezone.utc).isoformat()},
-        ]
-    }, headers=auth_headers)
+    owner = register(client, "owner")
+    base_res = client.post("/api/v1/bases/claim", json={"points": square_loop()}, headers=owner["headers"])
     assert base_res.status_code == 200
     territory_id = base_res.json()["base_id"]
 
@@ -78,21 +64,26 @@ def test_screen_11_clubs_and_leaderboard(client, auth_headers):
     club_names = [c["name"] for c in clubs]
     assert "Chennai Runners" in club_names
 
-    # 2. Join club
-    res_join = client.post("/api/v1/clubs/1/join", headers=auth_headers)
-    assert res_join.status_code == 200
-    assert "Successfully joined" in res_join.json()["message"]
+    club_id = next(c["id"] for c in clubs if c["name"] == "Chennai Runners")
+
+    # 2. Join club (twice: joining is idempotent and must not inflate member_count)
+    before = client.get(f"/api/v1/clubs/{club_id}").json()["member_count"]
+    for _ in range(2):
+        res_join = client.post(f"/api/v1/clubs/{club_id}/join", headers=auth_headers)
+        assert res_join.status_code == 200
+        assert "Successfully joined" in res_join.json()["message"]
+    club = client.get(f"/api/v1/clubs/{club_id}", headers=auth_headers).json()
+    assert club["is_joined"] is True
+    assert club["member_count"] <= before + 1
 
     # 3. Club Leaderboard
-    res_lb = client.get("/api/v1/clubs/1/leaderboard?current_user_id=1")
+    res_lb = client.get(f"/api/v1/clubs/{club_id}/leaderboard", headers=auth_headers)
     assert res_lb.status_code == 200
     lb_data = res_lb.json()
-    assert len(lb_data["leaderboard"]) == 5
-    # Check top ranks match design: runvicky (#1), priya_r (#2), adventurer99 (#3)
-    usernames = [m["username"] for m in lb_data["leaderboard"]]
-    assert "runvicky" in usernames
-    assert "priya_r" in usernames
-    assert "adventurer99" in usernames
+    me = next(m for m in lb_data["leaderboard"] if m["is_current_user"])
+    assert me["username"] == "fastrunner"
+    assert me["runner_name"] == "fastrunner"
+    assert [m["rank"] for m in lb_data["leaderboard"]] == list(range(1, len(lb_data["leaderboard"]) + 1))
 
 
 def test_screen_12_profile_and_stats(client, auth_headers):
@@ -117,7 +108,7 @@ def test_screen_12_profile_and_stats(client, auth_headers):
     assert res_terrs.status_code == 200
     assert "bases" in res_terrs.json()
 
-    # 4. Achievements (12 Badges)
-    res_ach = client.get(f"/api/v1/users/{user_id}/achievements")
+    # 4. Achievements (fastrunner has finished runs in this session)
+    res_ach = client.get(f"/api/v1/users/{user_id}/achievements", headers=auth_headers)
     assert res_ach.status_code == 200
     assert res_ach.json()["total_badges"] >= 1

@@ -1,171 +1,175 @@
-from datetime import datetime, timezone
-import uuid
-from fastapi import APIRouter, Depends, HTTPException, Query
-from shapely.geometry import Polygon
-from shapely.validation import make_valid
-from pyproj import Geod
+from typing import Optional
 
-from db.db_conn import (
-    sqlite_connection,
-    fetch_record,
-    execute_query,
-    execute_query_one,
-    insert_record_get_id,
-    insert_records,
-)
+from fastapi import APIRouter, Depends, HTTPException, Query
+
+from db.database import connection
 from models.datamodel import (
     ChallengeRequest,
     ChallengeResponse,
     ClaimFromRunRequest,
     HomeMapResponse,
-    HomeMapTerritory,
     NearbyTerritoriesResponse,
-    NearbyTerritoryItem,
     TerritoryClaimedResponse,
     TerritoryDetailResponse,
 )
-from routers.core import get_current_user, get_activity_with_ownership, verify_ownership
+from routers.core import get_current_user, get_current_user_optional
+from services import territory_service
+from services.run_service import ACTIVE_RUNNER_WINDOW
+from services.territory_service import DEFAULT_COLOR, TERRITORY_SELECT, effective_defense_level
+from utils.geo import bbox_for_radius, distance_to_polygon_m, load_polygon, simplify_for_client
+from utils.helper import format_pace, iso, utcnow
 
 router = APIRouter(prefix="/api/v1", tags=["territories"])
 
-
-
-from shapely import wkt
-from routers.runs_router import _haversine_distance_km
+MAX_MAP_TERRITORIES = 1000
 
 
 @router.get("/territories/nearby", response_model=NearbyTerritoriesResponse)
 async def get_nearby_territories(
     lat: float = Query(13.0827, ge=-90, le=90),
     lng: float = Query(80.2707, ge=-180, le=180),
-    radius_km: float = Query(5.0, ge=0.5, le=50.0),
+    radius_km: float = Query(5.0, gt=0, le=50.0),
+    limit: int = Query(50, ge=1, le=200),
 ):
     """
-    Screen 5: Location Permission Screen
-    Fetches real nearby territories from DB computed using Haversine distance.
+    Screens 5/6: active territories within `radius_km` of a point, nearest
+    first. Distance is 0 when the point is inside the territory.
     """
-    conn = await sqlite_connection()
-    try:
-        rows = await execute_query(
-            conn,
-            """
-            SELECT cb.id, cb.name, cb.area, cb.color, cb.polygon_wkt, u.username as owner_username
-            FROM claimed_bases cb
-            JOIN users u ON cb.user_id = u.id
-            WHERE cb.status = 'active'
-            """
+    min_lat, min_lng, max_lat, max_lng = bbox_for_radius(lat, lng, radius_km)
+    async with connection() as conn:
+        rows = await conn.fetch(
+            TERRITORY_SELECT + """
+            WHERE t.status = 'active'
+              AND t.max_lat >= $1 AND t.min_lat <= $2 AND t.max_lng >= $3 AND t.min_lng <= $4
+            LIMIT $5
+            """,
+            min_lat, max_lat, min_lng, max_lng, MAX_MAP_TERRITORIES,
         )
-        items = []
-        for r in rows:
-            area_km2 = round(r["area"] / 1_000_000, 2)
-            c_lat, c_lng = lat, lng
-            try:
-                geom = wkt.loads(r["polygon_wkt"])
-                c_lng, c_lat = geom.centroid.x, geom.centroid.y
-            except Exception:
-                pass
-            dist = round(_haversine_distance_km(lat, lng, c_lat, c_lng), 2)
-            if dist <= radius_km or len(items) < 3:
-                items.append(NearbyTerritoryItem(
-                    id=r["id"],
-                    name=r["name"] or f"Territory #{r['id']}",
-                    owner_username=r["owner_username"],
-                    color=r["color"] or "#00E5FF",
-                    area_km2=area_km2,
-                    distance_km=dist,
-                ))
 
-        items.sort(key=lambda x: x.distance_km)
-
-        return {
-            "latitude": lat,
-            "longitude": lng,
-            "radius_km": radius_km,
-            "total_nearby": len(items),
-            "territories": items,
-        }
-    finally:
-        await conn.close()
+    items = []
+    for r in rows:
+        polygon = load_polygon(r["polygon_wkt"])
+        if polygon is None:
+            continue
+        distance_m = distance_to_polygon_m(lat, lng, polygon)
+        if distance_m > radius_km * 1000:
+            continue
+        color = r["owner_color"] or DEFAULT_COLOR
+        items.append({
+            "id": r["id"],
+            "name": r["name"],
+            "owner_id": str(r["owner_id"]) if r["owner_id"] is not None else None,
+            "owner_username": r["owner_username"] or "",
+            "owner_color": color,
+            "color": color,
+            "area_km2": r["area_km2"],
+            "distance_meters": round(distance_m, 1),
+            "distance_km": round(distance_m / 1000, 2),
+        })
+    items.sort(key=lambda item: item["distance_meters"])
+    items = items[:limit]
+    return {
+        "latitude": lat,
+        "longitude": lng,
+        "radius_km": radius_km,
+        "count": len(items),
+        "total_nearby": len(items),
+        "territories": items,
+    }
 
 
 @router.get("/map/home", response_model=HomeMapResponse)
 async def get_home_map(
-    user_id: str = Query("1", description="Current logged-in user ID"),
-    lat: float = Query(13.0827),
-    lng: float = Query(80.2707),
+    user_id: Optional[int] = Query(None, description="Legacy: viewer id when no Bearer token is sent"),
+    lat: float = Query(13.0827, ge=-90, le=90),
+    lng: float = Query(80.2707, ge=-180, le=180),
+    radius_km: float = Query(10.0, gt=0, le=100.0),
+    min_lat: Optional[float] = Query(None, ge=-90, le=90),
+    min_lng: Optional[float] = Query(None, ge=-180, le=180),
+    max_lat: Optional[float] = Query(None, ge=-90, le=90),
+    max_lng: Optional[float] = Query(None, ge=-180, le=180),
+    current_user: Optional[dict] = Depends(get_current_user_optional),
 ):
     """
-    Screen 6: Home Map API
-    Returns territories classified by ownership from DB:
-    - Cyan: Your Territory
-    - Magenta: Club Territory
-    - Grey: Unclaimed zones
+    Screen 6: territories in the viewport (bbox) or around lat/lng, with
+    ownership flags for the caller and HUD counters.
     """
-    conn = await sqlite_connection()
-    try:
-        user = await fetch_record(conn, "users", "id", (int(user_id) if user_id.isdigit() else 1,))
-        user_club_id = user["club_id"] if user else None
+    bbox = (min_lat, min_lng, max_lat, max_lng)
+    if any(v is not None for v in bbox):
+        if any(v is None for v in bbox):
+            raise HTTPException(status_code=422, detail="min_lat, min_lng, max_lat and max_lng must be sent together")
+        if min_lat > max_lat or min_lng > max_lng:
+            raise HTTPException(status_code=422, detail="Bounding box minimums must not exceed maximums")
+    else:
+        bbox = bbox_for_radius(lat, lng, radius_km)
+    b_min_lat, b_min_lng, b_max_lat, b_max_lng = bbox
 
-        active_runners_row = await execute_query_one(
-            conn,
-            "SELECT count(DISTINCT user_id) as cnt FROM runs WHERE status = 'in_progress'",
-        )
-        active_runners_nearby = active_runners_row["cnt"] if active_runners_row else 0
+    async with connection() as conn:
+        viewer_id = current_user["id"] if current_user else user_id
+        viewer_club_id = None
+        if current_user:
+            viewer_club_id = current_user["club_id"]
+        elif viewer_id is not None:
+            viewer_club_id = await conn.fetchval("SELECT club_id FROM users WHERE id = $1", viewer_id)
 
-        unclaimed_row = await execute_query_one(
-            conn,
-            "SELECT count(*) as cnt FROM claimed_bases WHERE status = 'unclaimed'",
-        )
-        unclaimed_count = unclaimed_row["cnt"] if unclaimed_row else 0
-
-        rows = await execute_query(
-            conn,
+        rows = await conn.fetch(
             """
-            SELECT cb.*, u.username as owner_username, u.territory_color, c.name as club_name, c.color as club_color
-            FROM claimed_bases cb
-            LEFT JOIN users u ON cb.user_id = u.id
-            LEFT JOIN clubs c ON cb.club_id = c.id
-            WHERE cb.status = 'active'
-            ORDER BY cb.id DESC
+            SELECT t.*,
+                   COALESCE(t.owner_id = $6::int, FALSE) AS is_user_territory,
+                   COALESCE(t.club_id = $7::int, FALSE) AS is_club_territory,
+                   u.username AS owner_username, u.territory_color AS owner_color,
+                   c.name AS club_name, c.color AS club_color
+            FROM territories t
+            LEFT JOIN users u ON u.id = t.owner_id
+            LEFT JOIN clubs c ON c.id = t.club_id
+            WHERE t.max_lat >= $1 AND t.min_lat <= $2 AND t.max_lng >= $3 AND t.min_lng <= $4
+            ORDER BY t.id DESC
+            LIMIT $5
+            """,
+            b_min_lat, b_max_lat, b_min_lng, b_max_lng, MAX_MAP_TERRITORIES, viewer_id, viewer_club_id,
+        )
+        counters = await conn.fetchrow(
             """
+            SELECT
+                (SELECT count(*) FROM territories WHERE status = 'active' AND owner_id = $1) AS user_count,
+                (SELECT count(*) FROM territories WHERE status = 'active' AND club_id = $2) AS club_count,
+                (SELECT count(DISTINCT user_id) FROM runs
+                  WHERE status IN ('recording', 'paused') AND last_telemetry_at > $3
+                    AND current_latitude BETWEEN $4 AND $5 AND current_longitude BETWEEN $6 AND $7) AS active_runners
+            """,
+            viewer_id, viewer_club_id, utcnow() - ACTIVE_RUNNER_WINDOW,
+            b_min_lat, b_max_lat, b_min_lng, b_max_lng,
         )
 
-        territories = []
-        user_cnt = 0
-        club_cnt = 0
+    territories = []
+    unclaimed = 0
+    for r in rows:
+        if r["status"] == "unclaimed":
+            unclaimed += 1
+        territories.append({
+            "id": r["id"],
+            "name": r["name"],
+            "owner_id": str(r["owner_id"]) if r["owner_id"] is not None else None,
+            "owner_username": r["owner_username"] or "",
+            "owner_color": r["owner_color"] or DEFAULT_COLOR,
+            "club_id": r["club_id"],
+            "club_name": r["club_name"],
+            "club_color": r["club_color"],
+            "status": r["status"],
+            "area_km2": r["area_km2"],
+            "defense_level": effective_defense_level(r),
+            "polygon_wkt": simplify_for_client(r["polygon_wkt"], r["area_km2"]),
+            "is_user_territory": r["is_user_territory"],
+            "is_club_territory": r["is_club_territory"],
+        })
 
-        for r in rows:
-            is_user = str(r["user_id"]) == str(user_id)
-            is_club = (user_club_id is not None and r["club_id"] == user_club_id) and not is_user
-            if is_user:
-                user_cnt += 1
-            elif is_club:
-                club_cnt += 1
-
-            area_km2 = round(r["area"] / 1_000_000, 2)
-            territories.append(HomeMapTerritory(
-                id=r["id"],
-                name=r["name"] or f"Territory #{r['id']}",
-                owner_id=str(r["user_id"]),
-                owner_username=r["owner_username"] or "runner",
-                owner_color=r["color"] or "#00E5FF",
-                club_name=r["club_name"],
-                club_color=r["club_color"] or "#E91E63",
-                area_km2=area_km2,
-                polygon_wkt=r["polygon_wkt"],
-                is_user_territory=is_user,
-                is_club_territory=is_club,
-            ))
-
-        return {
-            "active_runners_nearby": active_runners_nearby,
-            "user_territories_count": user_cnt,
-            "club_territories_count": club_cnt,
-            "unclaimed_territories_count": unclaimed_count,
-            "territories": territories,
-        }
-    finally:
-        await conn.close()
+    return {
+        "active_runners_nearby": counters["active_runners"],
+        "user_territories_count": counters["user_count"],
+        "club_territories_count": counters["club_count"],
+        "unclaimed_territories_count": unclaimed,
+        "territories": territories,
+    }
 
 
 @router.post("/territories/claim-from-run", response_model=TerritoryClaimedResponse)
@@ -174,223 +178,114 @@ async def claim_territory_from_run(
     current_user: dict = Depends(get_current_user),
 ):
     """
-    Screen 9: Territory Claimed (Success Screen)
-    Converts a completed closed-loop run into an official claimed territory in DB.
-    Awards celebration payload, badge, and share text.
+    Screen 9: turn a closed-loop run into a territory. Area and perimeter
+    are computed server-side. A loop that matches an existing base (> 75%
+    overlap) fortifies your own base, or takes over a rival's base when
+    your pace beats its record.
     """
-    conn = await sqlite_connection()
-    try:
-        run = await fetch_record(conn, "runs", "activity_id", (request.activity_id,))
-        now_iso = datetime.now(timezone.utc).isoformat()
-        if not run:
-            # Auto-recover offline or serverless cold-started run session for authenticated user
-            await insert_records(
-                conn,
-                "runs",
-                ["activity_id", "user_id", "title", "start_time", "end_time", "status", "distance_km", "duration_seconds", "is_claimed"],
-                [request.activity_id, str(current_user["id"]), request.territory_name or "Circuit Run", now_iso, now_iso, "completed", request.perimeter_km or 1.0, 300, 0]
-            )
-            run = await fetch_record(conn, "runs", "activity_id", (request.activity_id,))
-        else:
-            verify_ownership(run["user_id"], current_user["id"])
-
-        if run["is_claimed"] == 1:
-            raise HTTPException(status_code=400, detail="This run has already been claimed as a territory")
-
-        pts = await execute_query(
-            conn,
-            "SELECT latitude, longitude FROM telemetry_points WHERE activity_id = ? ORDER BY id ASC",
-            (request.activity_id,),
-        )
-
-        # Ingest client points if DB points are insufficient
-        if len(pts) < 3 and request.points and len(request.points) >= 3:
-            records = [
-                (
-                    request.activity_id,
-                    str(current_user["id"]),
-                    p.latitude,
-                    p.longitude,
-                    p.altitude or 0.0,
-                    p.speed or 0.0,
-                    p.accuracy or 5.0,
-                    p.timestamp.isoformat() if hasattr(p.timestamp, 'isoformat') else str(p.timestamp),
-                )
-                for p in request.points
-            ]
-            await conn.executemany(
-                """
-                INSERT INTO telemetry_points (activity_id, user_id, latitude, longitude, altitude, speed, accuracy, timestamp)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                records,
-            )
-            await conn.commit()
-            pts = [{"latitude": p.latitude, "longitude": p.longitude} for p in request.points]
-
-        if len(pts) < 3:
-            raise HTTPException(
-                status_code=400,
-                detail="At least 3 GPS points forming a closed loop are required to claim territory. Please make sure location tracking is on and complete a circuit.",
-            )
-
-        coords = [(p["longitude"], p["latitude"]) for p in pts]
-        if coords[0] != coords[-1]:
-            coords.append(coords[0])
-
-        poly = make_valid(Polygon(coords))
-        if not poly.is_valid or poly.is_empty:
-            poly = make_valid(poly)
-
-        geod = Geod(ellps='WGS84')
-        area, perimeter = geod.geometry_area_perimeter(poly)
-        area_sqm = abs(area)
-        perimeter_m = abs(perimeter)
-        area_km2 = round(area_sqm / 1_000_000, 2)
-        if area_km2 == 0 and request.area_km2:
-            area_km2 = request.area_km2
-            area_sqm = area_km2 * 1_000_000
-
-        user = await fetch_record(conn, "users", "id", (int(run["user_id"]) if str(run["user_id"]).isdigit() else 1,))
-        owner_username = user["username"] if user else current_user["username"]
-        owner_avatar = user["avatar_url"] if user else ""
-        owner_color = user["territory_color"] if user else "#00E5FF"
-        club_id = user["club_id"] if user else None
-        territory_name = request.territory_name or f"Territory #{run['id']}"
-
-        # Save to claimed_bases in DB
-        territory_id = await insert_record_get_id(
-            conn,
-            "claimed_bases",
-            ["name", "user_id", "club_id", "status", "area", "perimeter", "polygon_wkt", "color", "total_runs", "total_km"],
-            [territory_name, str(run["user_id"]), club_id, "active", area_sqm, perimeter_m, poly.wkt, owner_color, 1, run["distance_km"] or 0.0],
-        )
-
-        # Mark run as claimed in DB
-        await conn.execute("UPDATE runs SET is_claimed = 1 WHERE activity_id = ?", (request.activity_id,))
-
-        # Update club statistics in DB if user is member of a club
-        if club_id:
-            await conn.execute("""
-                UPDATE club_members 
-                SET territories_contributed = territories_contributed + 1, km_contributed = km_contributed + ?
-                WHERE club_id = ? AND user_id = ?
-            """, (run["distance_km"] or 0.0, club_id, str(run["user_id"])))
-            await conn.execute("""
-                UPDATE clubs 
-                SET territory_count = territory_count + 1, total_km = total_km + ?
-                WHERE id = ?
-            """, (run["distance_km"] or 0.0, club_id))
-
-        # Unlock celebration badge in DB
-        badge_title = f"{territory_name} Conqueror"
-        await insert_records(
-            conn,
-            "achievements",
-            ["user_id", "title", "description", "badge_icon"],
-            [str(run["user_id"]), badge_title, f"Claimed {area_km2} km² turf at {territory_name}", "crown"],
-        )
-        await conn.commit()
-
-        share_text = f"I just claimed {territory_name} ({area_km2} km²) on Run to Claim! Can you conquer my turf? #RunToClaim"
-
-        return {
-            "status": "success",
-            "message": "Territory claimed successfully",
-            "territory_id": territory_id,
-            "territory_name": territory_name,
-            "area_km2": area_km2,
-            "perimeter_km": round(perimeter_m / 1000, 2),
-            "owner_username": owner_username,
-            "owner_avatar": owner_avatar or "",
-            "polygon_wkt": poly.wkt,
-            "badge_earned": badge_title,
-            "share_text": share_text,
-        }
-    finally:
-        await conn.close()
+    return await territory_service.claim_from_run(current_user, request)
 
 
 @router.get("/territories/{territory_id}", response_model=TerritoryDetailResponse)
 async def get_territory_details(
     territory_id: int,
-    current_user_id: str = Query("1", description="Current viewer user ID"),
+    current_user_id: Optional[int] = Query(None, description="Legacy: viewer id when no Bearer token is sent"),
+    current_user: Optional[dict] = Depends(get_current_user_optional),
 ):
     """
-    Screen 10: Territory Details from DB.
+    Screen 10: owner, club, defense stats and record pace of a territory.
     """
-    conn = await sqlite_connection()
-    try:
-        row = await execute_query_one(
-            conn,
-            """
-            SELECT cb.*, u.username as owner_username, u.avatar_url as owner_avatar, u.territory_color
-            FROM claimed_bases cb
-            LEFT JOIN users u ON cb.user_id = u.id
-            WHERE cb.id = ?
-            """,
-            (territory_id,),
-        )
-        if not row:
-            raise HTTPException(status_code=404, detail="Territory not found")
+    async with connection() as conn:
+        row = await conn.fetchrow(TERRITORY_SELECT + " WHERE t.id = $1", territory_id)
+    if not row:
+        raise HTTPException(status_code=404, detail="Territory not found")
 
-        area_km2 = round(row["area"] / 1_000_000, 2)
-        perimeter_km = round(row["perimeter"] / 1000, 2)
-        claimed_dt = datetime.fromisoformat(row["created_at"]) if "T" in str(row["created_at"]) else datetime.now(timezone.utc)
-        days_active = max((datetime.now(timezone.utc) - claimed_dt).days, 1)
-
-        return {
-            "id": row["id"],
-            "name": row["name"] or f"Territory #{row['id']}",
-            "area_km2": area_km2,
-            "perimeter_km": perimeter_km,
-            "claimed_on": claimed_dt.strftime("%b %d, %Y"),
-            "owner_id": str(row["user_id"]),
-            "owner_username": row["owner_username"] or "runner",
-            "owner_avatar": row["owner_avatar"] or "",
-            "owner_color": row["color"] or "#00E5FF",
-            "total_runs": row["total_runs"] or 1,
-            "total_km": round(row["total_km"] or 0.0, 1),
-            "days_active": days_active,
-            "polygon_wkt": row["polygon_wkt"],
-            "is_owner": str(row["user_id"]) == str(current_user_id),
-        }
-    finally:
-        await conn.close()
+    now = utcnow()
+    viewer_id = current_user["id"] if current_user else current_user_id
+    is_owner = viewer_id is not None and row["owner_id"] == viewer_id
+    return {
+        "id": row["id"],
+        "name": row["name"],
+        "status": row["status"],
+        "area_km2": row["area_km2"],
+        "perimeter_km": row["perimeter_km"],
+        "claimed_on": row["conquered_at"].strftime("%b %d, %Y"),
+        "held_since": iso(row["conquered_at"]),
+        "owner_id": str(row["owner_id"]) if row["owner_id"] is not None else None,
+        "owner_username": row["owner_username"] or "",
+        "owner_avatar": row["owner_avatar"] or "",
+        "owner_color": row["owner_color"] or DEFAULT_COLOR,
+        "club_id": row["club_id"],
+        "club_name": row["club_name"],
+        "club_color": row["club_color"],
+        "record_pace": format_pace(row["record_pace_seconds"]),
+        "record_pace_seconds": row["record_pace_seconds"],
+        "defense_level": effective_defense_level(row, now),
+        "times_defended": row["times_defended"],
+        "times_challenged": row["times_challenged"],
+        "total_runs": row["total_runs"],
+        "total_km": round(row["total_km"], 1),
+        "days_active": max((now - row["conquered_at"]).days, 1),
+        "polygon_wkt": row["polygon_wkt"],
+        "is_owner": is_owner,
+        "is_user_territory": is_owner,
+        "can_challenge": viewer_id is not None and not is_owner,
+    }
 
 
 @router.post("/territories/{territory_id}/challenge", response_model=ChallengeResponse)
 async def challenge_territory(
     territory_id: int,
-    request: ChallengeRequest,
+    request: Optional[ChallengeRequest] = None,
     current_user: dict = Depends(get_current_user),
 ):
     """
-    Screen 10: Challenge Territory Owner
-    Initiates a turf war challenge against the current owner.
+    Screen 10: register intent to challenge a rival base. Beat its record
+    pace on the perimeter and claim the run to take it over.
     """
-    conn = await sqlite_connection()
-    try:
-        t = await fetch_record(conn, "claimed_bases", "id", (territory_id,))
-        if not t:
-            raise HTTPException(status_code=404, detail="Territory not found")
+    async with connection() as conn:
+        async with conn.transaction():
+            row = await conn.fetchrow(TERRITORY_SELECT + " WHERE t.id = $1", territory_id)
+            if not row:
+                raise HTTPException(status_code=404, detail="Territory not found")
+            if row["owner_id"] == current_user["id"]:
+                raise HTTPException(status_code=400, detail="You cannot challenge your own territory")
 
-        owner_user = await fetch_record(conn, "users", "id", (int(t["user_id"]) if str(t["user_id"]).isdigit() else 1,))
-        owner_name = owner_user["username"] if owner_user else "adventurer99"
+            challenge = await conn.fetchrow(
+                """
+                SELECT challenge_id FROM challenges
+                WHERE territory_id = $1 AND challenger_id = $2 AND status = 'active'
+                """,
+                territory_id, current_user["id"],
+            )
+            if challenge is None:
+                challenge = await conn.fetchrow(
+                    """
+                    INSERT INTO challenges (challenge_id, territory_id, challenger_id, target_pace_seconds)
+                    VALUES ($1, $2, $3, $4)
+                    RETURNING challenge_id
+                    """,
+                    territory_service.new_challenge_id(), territory_id, current_user["id"], row["record_pace_seconds"],
+                )
 
-        challenge_id = f"chal_{uuid.uuid4().hex[:8]}"
-        t_name = t["name"] or f"Territory #{t['id']}"
-        instructions = f"Run around {t_name} and complete the loop to steal this territory from @{owner_name}!"
-        challenger_id = str(current_user["id"])
-
-        return {
-            "challenge_id": challenge_id,
-            "territory_id": territory_id,
-            "territory_name": t_name,
-            "current_owner": owner_name,
-            "challenger_id": challenger_id,
-            "status": "challenge_active",
-            "instructions": instructions,
-        }
-    finally:
-        await conn.close()
+    target_pace = format_pace(row["record_pace_seconds"])
+    owner = row["owner_username"] or "nobody"
+    if row["record_pace_seconds"]:
+        instructions = (
+            f"Run the {row['perimeter_km']:.2f} km perimeter of {row['name']} faster than {target_pace} /km "
+            f"to claim this base from @{owner}!"
+        )
+    else:
+        instructions = f"Run the {row['perimeter_km']:.2f} km perimeter of {row['name']} to claim this base!"
+    return {
+        "challenge_id": challenge["challenge_id"],
+        "territory_id": territory_id,
+        "target_territory_id": territory_id,
+        "territory_name": row["name"],
+        "current_owner": owner,
+        "challenger_id": str(current_user["id"]),
+        "status": "challenge_active",
+        "target_pace": target_pace,
+        "target_distance_km": row["perimeter_km"],
+        "instructions": instructions,
+    }

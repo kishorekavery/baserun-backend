@@ -10,10 +10,7 @@ scripts/
 __pycache__/
 *.pyc
 *.pyo
-baserun.db
-test_baserun.db
-*.sqlite
-*.sqlite3
+*.db
 .vscode/
 .idea/
 .DS_Store

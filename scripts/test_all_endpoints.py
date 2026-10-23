@@ -1,16 +1,28 @@
-import asyncio
+"""
+Smoke-tests every endpoint and writes endpoint_test_results.json.
+Writes test users/runs, so it only runs against a disposable database:
+
+    TEST_DATABASE_URL=postgresql://postgres@127.0.0.1:5432/baserun_test python scripts/test_all_endpoints.py
+"""
 import json
+import os
+import sys
 import uuid
 from datetime import datetime, timezone
-import pytest
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
+if not os.getenv("TEST_DATABASE_URL"):
+    sys.exit("Set TEST_DATABASE_URL to a disposable PostgreSQL database to run this script.")
+os.environ["DATABASE_URL"] = os.environ["TEST_DATABASE_URL"]
+os.environ.setdefault("SOCIAL_LOGIN_ALLOW_UNVERIFIED", "true")
+
 from fastapi.testclient import TestClient
 from main import app
-from db.db_conn import init_db
-
-# Initialize database tables & seed data
-asyncio.run(init_db())
 
 client = TestClient(app)
+client.__enter__()
 results = []
 
 def record(category, function_name, method, endpoint, status_code, ok, note=""):
@@ -126,7 +138,7 @@ r = client.get(f"/users/{numeric_user_id}/territories")
 record(cat, "getUserTerritories()", "GET", f"/users/{numeric_user_id}/territories", r.status_code, r.status_code == 200, f"Bases: {len(r.json().get('bases', []))}")
 
 # getUserAchievements()
-r = client.get(f"/users/{numeric_user_id}/achievements")
+r = client.get(f"/users/{numeric_user_id}/achievements", headers=auth_headers)
 record(cat, "getUserAchievements()", "GET", f"/users/{numeric_user_id}/achievements", r.status_code, r.status_code == 200, f"Badges: {r.json().get('total_badges')}")
 
 # getUserStats()
@@ -223,15 +235,15 @@ r = client.post(f"/api/v1/runs/{act_id}/telemetry", json=telemetry_payload, head
 record(cat, "postTelemetry()", "POST", f"/api/v1/runs/{act_id}/telemetry", r.status_code, r.status_code == 200, f"Saved points: {r.json().get('saved_points')}")
 
 # getLiveRunStats()
-r = client.get(f"/api/v1/runs/{act_id}/live")
+r = client.get(f"/api/v1/runs/{act_id}/live", headers=auth_headers)
 record(cat, "getLiveRunStats()", "GET", f"/api/v1/runs/{act_id}/live", r.status_code, r.status_code == 200, f"Distance: {r.json().get('distance_km')} km, Pace: {r.json().get('pace_formatted')}")
 
 # getRunPath()
-r = client.get(f"/api/v1/runs/{act_id}/path")
+r = client.get(f"/api/v1/runs/{act_id}/path", headers=auth_headers)
 record(cat, "getRunPath()", "GET", f"/api/v1/runs/{act_id}/path", r.status_code, r.status_code == 200, f"Breadcrumbs: {r.json().get('total_points')}")
 
 # getActivityTelemetry()
-r = client.get(f"/api/v1/bases/telemetry/{act_id}")
+r = client.get(f"/api/v1/bases/telemetry/{act_id}", headers=auth_headers)
 record(cat, "getActivityTelemetry()", "GET", f"/api/v1/bases/telemetry/{act_id}", r.status_code, r.status_code == 200, f"Telemetry pts: {r.json().get('total_points')}")
 
 # pauseRun()
@@ -247,7 +259,7 @@ r = client.post(f"/api/v1/runs/{act_id}/finish", json={"steps": 3200, "calories"
 record(cat, "finishRun()", "POST", f"/api/v1/runs/{act_id}/finish", r.status_code, r.status_code == 200, f"Finished, can_claim: {r.json().get('can_claim_territory')}")
 
 # getRunSummary()
-r = client.get(f"/api/v1/runs/{act_id}/summary")
+r = client.get(f"/api/v1/runs/{act_id}/summary", headers=auth_headers)
 record(cat, "getRunSummary()", "GET", f"/api/v1/runs/{act_id}/summary", r.status_code, r.status_code == 200, f"Distance: {r.json().get('distance_km')} km")
 
 # getUserRuns()

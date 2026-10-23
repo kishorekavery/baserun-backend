@@ -1,6 +1,6 @@
 import uuid
 import pytest
-from db.db_conn import cleanup_expired_sessions
+from db.database import cleanup_expired_sessions
 from routers.core import SESSION_TTL_SECONDS
 
 

@@ -110,8 +110,9 @@ def test_login_non_existent_user(client):
         "username": "user_does_not_exist_9999",
         "password": "Password123!"
     })
-    assert res.status_code == 404
-    assert Message.USER_NOT_FOUND in res.json()["detail"]
+    # Same response as a wrong password, so usernames cannot be enumerated
+    assert res.status_code == 401
+    assert Message.INVALID_USERNAME_OR_PASSWORD in res.json()["detail"]
 
 
 def test_get_current_user_me(client, auth_headers, registered_user):

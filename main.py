@@ -1,18 +1,20 @@
+import logging
 from contextlib import asynccontextmanager
 from dotenv import load_dotenv
 
 # Load environment variables before importing modules that rely on them
 load_dotenv()
 
-from fastapi import FastAPI
+import asyncpg
+from fastapi import FastAPI, Request
+from fastapi.encoders import jsonable_encoder
+from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
-from db.db_conn import (
-    init_db,
-    init_external_db,
-    close_external_db,
-    check_external_db_health,
-    db_config,
-)
+from fastapi.responses import JSONResponse
+from starlette.exceptions import HTTPException as StarletteHTTPException
+
+from db.config import db_config
+from db.database import check_db_health, close_db, init_db
 from routers import (
     app_info,
     auth_ext,
@@ -23,33 +25,88 @@ from routers import (
     users_router,
 )
 
+logger = logging.getLogger("baserun")
+
+ERROR_CODES = {
+    400: "BAD_REQUEST",
+    401: "UNAUTHORIZED",
+    403: "FORBIDDEN",
+    404: "NOT_FOUND",
+    405: "METHOD_NOT_ALLOWED",
+    409: "CONFLICT",
+    422: "VALIDATION_ERROR",
+    429: "TOO_MANY_REQUESTS",
+    503: "SERVICE_UNAVAILABLE",
+}
+
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # Initialize local SQLite tables
-    await init_db()
-    # Initialize external DB connection pool if credentials are configured
-    await init_external_db()
+    # Create the PostgreSQL pool and apply the schema. On serverless cold
+    # starts where lifespan does not run, the first query does this lazily.
+    try:
+        await init_db()
+    except Exception as exc:
+        logger.error("Database initialisation failed at startup: %s", exc)
     yield
-    # Gracefully close external DB connection pool
-    await close_external_db()
+    await close_db()
 
 
 app = FastAPI(
-    title="Run to Claim (Base Run) API",
-    description="Backend API supporting all 12 screens of the Run to Claim mobile application.",
+    title="BASER (Run to Claim) API",
+    description="Backend API supporting all 12 screens of the BASER mobile application.",
     version="1.0.0",
     lifespan=lifespan,
 )
 
-# Enable CORS for Flutter mobile clients and web interfaces
+# Enable CORS for Flutter mobile clients and web interfaces (token auth, no cookies)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
-    allow_credentials=True,
+    allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+@app.exception_handler(StarletteHTTPException)
+async def http_exception_handler(request: Request, exc: StarletteHTTPException):
+    detail = exc.detail.value if hasattr(exc.detail, "value") else exc.detail
+    return JSONResponse(
+        status_code=exc.status_code,
+        content={"detail": detail, "code": ERROR_CODES.get(exc.status_code, "ERROR")},
+        headers=getattr(exc, "headers", None),
+    )
+
+
+@app.exception_handler(RequestValidationError)
+async def validation_exception_handler(request: Request, exc: RequestValidationError):
+    return JSONResponse(
+        status_code=422,
+        content={"detail": jsonable_encoder(exc.errors()), "code": ERROR_CODES[422]},
+    )
+
+
+DB_UNAVAILABLE_ERRORS = (
+    OSError,
+    TimeoutError,
+    asyncpg.PostgresConnectionError,
+    asyncpg.CannotConnectNowError,
+    asyncpg.TooManyConnectionsError,
+)
+
+
+@app.exception_handler(Exception)
+async def unhandled_exception_handler(request: Request, exc: Exception):
+    if isinstance(exc, DB_UNAVAILABLE_ERRORS):
+        logger.error("Database unavailable on %s %s: %s", request.method, request.url.path, exc)
+        return JSONResponse(
+            status_code=503,
+            content={"detail": "Database temporarily unavailable, please retry", "code": ERROR_CODES[503]},
+        )
+    logger.exception("Unhandled error on %s %s", request.method, request.url.path)
+    return JSONResponse(status_code=500, content={"detail": "internal server error", "code": "INTERNAL_ERROR"})
+
 
 # Mount Core Base Run routes
 app.include_router(core.router)
@@ -68,7 +125,6 @@ app.include_router(users_router.router, prefix="/api/v1")
 app.include_router(runs_router.router, prefix="/api/v1")
 
 
-
 @app.get("/", tags=["health"])
 async def root():
     return {"status": "ok", "message": "Welcome to the Runners Application!"}
@@ -77,16 +133,10 @@ async def root():
 @app.get("/health/db", tags=["health"])
 async def db_health():
     """
-    Check the connectivity and status of configured databases (local SQLite and external DB).
+    PostgreSQL connectivity, latency and active session count.
+    Returns 503 when the database is unreachable.
     """
-    import os
-    sqlite_ok = os.path.exists(db_config.database_path)
-    external_health = await check_external_db_health()
-    return {
-        "sqlite": {
-            "path": db_config.database_path,
-            "status": "ready" if sqlite_ok else "not_created",
-        },
-        "external_db": external_health,
-        "config": db_config.to_dict(mask_secrets=True),
-    }
+    health = await check_db_health()
+    health["config"] = db_config.to_dict(mask_secrets=True)
+    status = 200 if health["connection"] == "ok" else 503
+    return JSONResponse(status_code=status, content=health)

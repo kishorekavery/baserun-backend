@@ -73,5 +73,6 @@ htmlcov/
 ehthumbs.db
 Thumbs.db
 
-# Logs
+# Logs & Test outputs
 *.log
+endpoint_test_results.json

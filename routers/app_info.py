@@ -1,41 +1,64 @@
+import os
+
 from fastapi import APIRouter
+
+from db.database import DEFAULT_SEASON, connection
 from models.datamodel import AppConfigResponse, ColorPaletteResponse, ColorPaletteItem
+from utils.helper import iso, utcnow
 
 router = APIRouter(prefix="/api/v1/app", tags=["app"])
+
+APP_NAME = "BASER"
+TAGLINE = "Turn Your Miles into Territory"
+WELCOME_QUOTE = "Run. Explore. Claim. Belong."
+
+COLOR_PALETTE = [
+    ColorPaletteItem(name="Electric Cyan", hex="#00E5FF"),
+    ColorPaletteItem(name="Neon Lime", hex="#76FF03"),
+    ColorPaletteItem(name="Hot Magenta", hex="#FF007F"),
+    ColorPaletteItem(name="Cyber Purple", hex="#7928CA"),
+    ColorPaletteItem(name="Blaze Orange", hex="#FF5722"),
+    ColorPaletteItem(name="Blaze Gold", hex="#FFD700", is_premium=True),
+]
+
+
+def _env_flag(name: str) -> bool:
+    return os.getenv(name, "false").strip().lower() in {"1", "true", "yes", "on"}
 
 
 @router.get("/config", response_model=AppConfigResponse)
 async def get_app_config():
     """
-    Screen 1: Splash Screen API
-    Returns app brand info, tagline, active season, and welcome quote.
+    Screen 1: brand info, current season, maintenance flag and minimum app version.
+    MAINTENANCE_MODE, APP_VERSION and APP_MIN_VERSION are read from the environment.
     """
+    now = utcnow()
+    async with connection() as conn:
+        season = await conn.fetchval(
+            """
+            SELECT name FROM seasons
+            WHERE starts_at <= $1 AND (ends_at IS NULL OR ends_at > $1)
+            ORDER BY starts_at DESC LIMIT 1
+            """,
+            now,
+        )
+    season = season or DEFAULT_SEASON[0]
     return {
-        "app_name": "Run to Claim",
-        "tagline": "YOUR RUN. YOUR TERRITORY. A BIGGER WORLD.",
-        "version": "1.0.0",
-        "active_season": "Season 1: Coastal Turf Wars",
-        "welcome_quote": "Run. Explore. Claim. Belong."
+        "app_name": APP_NAME,
+        "tagline": TAGLINE,
+        "current_season": season,
+        "active_season": season,
+        "version": os.getenv("APP_VERSION", "1.0.0"),
+        "min_version": os.getenv("APP_MIN_VERSION", "1.0.0"),
+        "maintenance_mode": _env_flag("MAINTENANCE_MODE"),
+        "server_time": iso(now),
+        "welcome_quote": WELCOME_QUOTE,
     }
 
 
 @router.get("/color-palette", response_model=ColorPaletteResponse)
 async def get_color_palette():
     """
-    Screen 4: Choose Your Identity Color Palette
-    Returns the curated 10 territory color swatches shown on Screen 4.
+    Screen 4: territory color swatches.
     """
-    return {
-        "colors": [
-            ColorPaletteItem(name="Neon Cyan", hex="#00E5FF"),
-            ColorPaletteItem(name="Electric Magenta", hex="#E91E63"),
-            ColorPaletteItem(name="Solar Orange", hex="#FF9100"),
-            ColorPaletteItem(name="Volt Lime", hex="#76FF03"),
-            ColorPaletteItem(name="Sunburst Yellow", hex="#FFEA00"),
-            ColorPaletteItem(name="Ocean Blue", hex="#00B0FF"),
-            ColorPaletteItem(name="Deep Purple", hex="#7C4DFF"),
-            ColorPaletteItem(name="Crimson Red", hex="#FF1744"),
-            ColorPaletteItem(name="Hot Pink", hex="#F50057"),
-            ColorPaletteItem(name="Stealth Charcoal", hex="#37474F"),
-        ]
-    }
+    return {"colors": COLOR_PALETTE}
