@@ -923,7 +923,116 @@ Member, territory, area and distance totals are aggregated live. A runner belong
 
 ---
 
-## 8. Migration Notes for Existing App Builds
+## 8. Friends & Friend Requests
+
+All friends routes require `Bearer <TOKEN>`; the caller always comes from the token. Every missing resource returns a specific `detail` (`"User not found"`, `"Friend request not found"`, ...), never the generic `"Not Found"`.
+
+### `RunnerSummary` (used by every friends response)
+```json
+{
+  "user_id": 2,
+  "username": "runvicky",
+  "first_name": "Vicky",
+  "last_name": "S",
+  "avatar_url": "https://assets.baserun.app/avatars/runner_02.png",
+  "territory_color": "#E91E63",
+  "club_name": "Chennai Runners",
+  "total_km": 120.4,
+  "bases_held": 9,
+  "friendship_status": "friends",
+  "request_id": null,
+  "friends_since": "2026-10-20T10:00:00Z"
+}
+```
+* **`friendship_status`** (relative to the caller): `none`, `friends`, `outgoing_pending`, `incoming_pending` or `self`.
+* **`request_id`:** the id of the pending request between you and this runner, otherwise `null`.
+* **`friends_since`:** only set in `GET /api/v1/friends`.
+* **Privacy:** emails are never included.
+
+### `FriendActionResponse` (returned by every write)
+```json
+{
+  "status": "success",
+  "message": "Friend request sent to @meena.run",
+  "friendship_status": "outgoing_pending",
+  "request_id": 101
+}
+```
+`friendship_status` is the state after the action.
+
+### `GET /api/v1/users/search?q={query}&limit=20` — Find Runners
+* **Query:** `q` is 2–32 characters (otherwise `422`); `limit` max `50`.
+* **Matching:** case-insensitive against username, first name and last name.
+* **Ordering:** exact username match, then friends, then username prefix matches, then alphabetical.
+* **Results:** the caller is included as `self` when they match.
+* **Response `(200 OK)`:**
+```json
+{ "query": "ru", "results": [ { "...RunnerSummary..." } ] }
+```
+
+### `GET /api/v1/friends` — My Friends
+* **Ordering:** sorted by username.
+* **`incoming_pending_count`:** drives the badge on Profile → Friends.
+* **Response `(200 OK)`:**
+```json
+{
+  "total": 1,
+  "incoming_pending_count": 2,
+  "friends": [ { "...RunnerSummary with friends_since..." } ]
+}
+```
+
+### `GET /api/v1/friends/requests` — Pending Requests
+* **Contents:** pending requests in both directions, newest first. `user` is always the other runner.
+* **Response `(200 OK)`:**
+```json
+{
+  "incoming": [
+    {
+      "id": 10,
+      "direction": "incoming",
+      "status": "pending",
+      "user": { "...RunnerSummary..." },
+      "created_at": "2026-10-24T08:00:00Z"
+    }
+  ],
+  "outgoing": []
+}
+```
+
+### `POST /api/v1/friends/requests` — Send Request
+* **Request Body:** `{ "to_user_id": 5 }` or `{ "username": "meena.run" }` (case-insensitive).
+* **Outcomes, checked in order:**
+  1. You are the target → `400` "You can't add yourself".
+  2. The target doesn't exist → `404` "User not found".
+  3. You are already friends → `409` "You are already friends".
+  4. You already sent a pending request → `409` "Friend request already sent".
+  5. **They already asked you** → their request is accepted instead: `200` with `friendship_status: "friends"` and "You are now friends with @x". This also happens if both runners send at the same moment.
+  6. More than 50 pending outgoing requests, or 30 sends in the last hour → `429`.
+  7. Otherwise → `200` with `friendship_status: "outgoing_pending"` and the new `request_id`.
+
+### `POST /api/v1/friends/requests/{request_id}/accept` — Accept
+* **Who:** recipient only (`403` otherwise).
+* **State:** the request must be pending (`409` "Request is no longer pending"). Unknown id → `404` "Friend request not found".
+* **Response `(200 OK)`:** `friendship_status: "friends"`.
+
+### `POST /api/v1/friends/requests/{request_id}/decline` — Decline
+* **Who and state:** recipient only, request must be pending; same errors as `/accept`.
+* **Effect:** the sender is not notified and may send a new request later.
+* **Response `(200 OK)`:** `friendship_status: "none"`.
+
+### `DELETE /api/v1/friends/requests/{request_id}` — Withdraw
+* **Who and state:** sender only (`403` otherwise), request must be pending (`409` otherwise).
+* **Response `(200 OK)`:** `friendship_status: "none"`.
+
+### `DELETE /api/v1/friends/{user_id}` — Unfriend
+* **Effect:** removes the friendship for both runners.
+* **Errors:** `404` "You are not friends with this runner" when there is no friendship.
+* **Response `(200 OK)`:** `friendship_status: "none"`.
+
+---
+
+## 9. Migration Notes for Existing App Builds
 
 | Area | Before | Now |
 | :--- | :--- | :--- |

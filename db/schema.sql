@@ -177,3 +177,29 @@ CREATE TABLE IF NOT EXISTS user_achievements (
     unlocked_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     UNIQUE (user_id, achievement_id)
 );
+
+-- 10. Friend requests (at most one pending request per pair, in either direction)
+CREATE TABLE IF NOT EXISTS friend_requests (
+    id BIGSERIAL PRIMARY KEY,
+    from_user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    to_user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    status VARCHAR(20) NOT NULL DEFAULT 'pending'
+        CHECK (status IN ('pending', 'accepted', 'declined', 'cancelled')),
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    responded_at TIMESTAMPTZ,
+    CHECK (from_user_id <> to_user_id)
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_friend_requests_one_pending_per_pair
+    ON friend_requests (LEAST(from_user_id, to_user_id), GREATEST(from_user_id, to_user_id))
+    WHERE status = 'pending';
+CREATE INDEX IF NOT EXISTS idx_friend_requests_incoming ON friend_requests (to_user_id) WHERE status = 'pending';
+CREATE INDEX IF NOT EXISTS idx_friend_requests_outgoing ON friend_requests (from_user_id, created_at);
+
+-- 11. Friendships, stored symmetrically: (a, b) and (b, a)
+CREATE TABLE IF NOT EXISTS friendships (
+    user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    friend_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    PRIMARY KEY (user_id, friend_id),
+    CHECK (user_id <> friend_id)
+);

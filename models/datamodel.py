@@ -615,3 +615,63 @@ class AchievementsResponse(BaseModel):
     user_id: str
     total_badges: int
     achievements: List[AchievementItem]
+
+
+# ==========================================
+# Friends & Friend Requests
+# ==========================================
+class RunnerSummary(BaseModel):
+    user_id: int
+    username: str
+    first_name: Optional[str] = None
+    last_name: Optional[str] = None
+    avatar_url: Optional[str] = None
+    territory_color: Optional[str] = None
+    club_name: Optional[str] = None
+    total_km: Optional[float] = None
+    bases_held: Optional[int] = None
+    friendship_status: str = Field(..., description="none | friends | outgoing_pending | incoming_pending | self")
+    request_id: Optional[int] = None
+    friends_since: Optional[str] = None
+
+
+class RunnerSearchResponse(BaseModel):
+    query: str
+    results: List[RunnerSummary]
+
+
+class FriendsResponse(BaseModel):
+    total: int
+    incoming_pending_count: int
+    friends: List[RunnerSummary]
+
+
+class FriendRequestItem(BaseModel):
+    id: int
+    direction: str = Field(..., description="incoming | outgoing")
+    status: str
+    user: RunnerSummary
+    created_at: str
+
+
+class FriendRequestsResponse(BaseModel):
+    incoming: List[FriendRequestItem]
+    outgoing: List[FriendRequestItem]
+
+
+class SendFriendRequest(BaseModel):
+    to_user_id: Optional[int] = None
+    username: Optional[str] = Field(None, min_length=1, max_length=64)
+
+    @model_validator(mode="after")
+    def validate_target(self) -> SendFriendRequest:
+        if self.to_user_id is None and not (self.username and self.username.strip()):
+            raise ValueError("Either to_user_id or username is required")
+        return self
+
+
+class FriendActionResponse(BaseModel):
+    status: str = "success"
+    message: str
+    friendship_status: str
+    request_id: Optional[int] = None

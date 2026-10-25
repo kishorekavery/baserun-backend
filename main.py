@@ -20,6 +20,7 @@ from routers import (
     auth_ext,
     clubs_router,
     core,
+    friends_router,
     runs_router,
     territories_router,
     users_router,
@@ -110,6 +111,9 @@ async def unhandled_exception_handler(request: Request, exc: Exception):
 
 # Mount Core Base Run routes
 app.include_router(core.router)
+
+# Before the /api/v1/users mount so /api/v1/users/search is matched here
+app.include_router(friends_router.router)
 
 # Mount feature routers at root level for Flutter ApiConfig compatibility
 app.include_router(auth_ext.router)
