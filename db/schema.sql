@@ -242,3 +242,34 @@ CREATE TABLE IF NOT EXISTS connected_accounts (
     connected_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     PRIMARY KEY (user_id, provider)
 );
+
+-- 16. Columns added after their tables first shipped (same lock-avoiding check as section 12)
+DO $$
+BEGIN
+    IF NOT EXISTS (
+        SELECT 1 FROM information_schema.columns
+        WHERE table_schema = 'public' AND table_name = 'users' AND column_name = 'is_premium'
+    ) THEN
+        ALTER TABLE users ADD COLUMN is_premium BOOLEAN NOT NULL DEFAULT FALSE;
+    END IF;
+    IF NOT EXISTS (
+        SELECT 1 FROM information_schema.columns
+        WHERE table_schema = 'public' AND table_name = 'users' AND column_name = 'avatar_thumb_url'
+    ) THEN
+        ALTER TABLE users ADD COLUMN avatar_thumb_url TEXT;
+    END IF;
+    IF NOT EXISTS (
+        SELECT 1 FROM information_schema.columns
+        WHERE table_schema = 'public' AND table_name = 'avatars' AND column_name = 'thumb'
+    ) THEN
+        ALTER TABLE avatars ADD COLUMN thumb BYTEA;
+    END IF;
+    -- A disconnected row is kept: social login matches by verified email and
+    -- would otherwise silently link the provider again on the next sign-in
+    IF NOT EXISTS (
+        SELECT 1 FROM information_schema.columns
+        WHERE table_schema = 'public' AND table_name = 'connected_accounts' AND column_name = 'disconnected_at'
+    ) THEN
+        ALTER TABLE connected_accounts ADD COLUMN disconnected_at TIMESTAMPTZ;
+    END IF;
+END $$;

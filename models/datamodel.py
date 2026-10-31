@@ -281,6 +281,7 @@ class IdentityResponse(BaseModel):
     username: str
     territory_color: str
     avatar_url: str
+    avatar_thumb_url: str = ""
     bio: Optional[str] = None
     club_id: Optional[int] = None
     club_name: Optional[str] = None
@@ -300,7 +301,13 @@ class AccountActionResponse(BaseModel):
 
 class DeleteAccountRequest(BaseModel):
     password: Optional[str] = Field(None, max_length=128, description="Required for password accounts")
-    confirmation: Optional[str] = Field(None, description='Social accounts have no password: send "DELETE"')
+    token: Optional[str] = Field(None, description="Google/Apple accounts: a fresh ID token from the provider")
+    email: Optional[str] = Field(None, description="Ignored unless SOCIAL_LOGIN_ALLOW_UNVERIFIED is on")
+
+
+class ConnectAppRequest(BaseModel):
+    token: str = Field(..., min_length=1, description="A fresh ID token from the provider")
+    email: Optional[str] = Field(None, description="Ignored unless SOCIAL_LOGIN_ALLOW_UNVERIFIED is on")
 
 
 class ConnectedApp(BaseModel):
@@ -309,6 +316,7 @@ class ConnectedApp(BaseModel):
     connected: bool
     connected_at: Optional[str] = None
     is_primary: bool = Field(..., description="The account was created with this provider")
+    can_disconnect: bool = False
 
 
 class ConnectedAppsResponse(BaseModel):
@@ -397,6 +405,7 @@ class LiveRunStatsResponse(BaseModel):
     duration_seconds: int
     duration_formatted: str
     pace_formatted: str
+    pace_seconds: int = Field(0, description="Seconds per km, for clients that display other units")
     current_speed_kmh: float
     points_count: int
     is_loop_closed: bool = False
@@ -437,6 +446,7 @@ class RunSummaryResponse(BaseModel):
     duration_seconds: int
     duration_formatted: str
     pace_formatted: str
+    pace_seconds: int = Field(0, description="Seconds per km, for clients that display other units")
     steps: int
     calories: int
     avg_speed_kmh: float
@@ -553,11 +563,13 @@ class ClubLeaderboardMember(BaseModel):
     username: str
     runner_name: str
     avatar_url: str
+    avatar_thumb_url: str = ""
     runner_avatar: str
     territories: int
     territories_held: int
     total_km: float
     avg_pace: str
+    avg_pace_seconds: int = 0
     is_current_user: bool = False
 
 
@@ -587,6 +599,7 @@ class UserStats(BaseModel):
     bases_claimed: int
     bases_held: int
     avg_pace: str
+    avg_pace_seconds: int = 0
 
 
 class FullUserProfileResponse(BaseModel):
@@ -606,9 +619,11 @@ class FullUserProfileResponse(BaseModel):
     club_name: Optional[str] = None
     favorite_base: Optional[str] = None
     stats: UserStats
+    avatar_thumb_url: str = ""
     is_restricted: bool = Field(False, description="True when privacy settings hide this runner's details from the viewer")
     privacy_level: Optional[str] = Field(None, description="Only returned to the runner themselves")
     auth_provider: Optional[str] = Field(None, description="password | google | apple; only returned to the runner themselves")
+    is_premium: Optional[bool] = Field(None, description="Only returned to the runner themselves")
 
 
 class RunHistoryItem(BaseModel):
@@ -620,6 +635,7 @@ class RunHistoryItem(BaseModel):
     duration: str
     duration_seconds: int
     pace: str
+    pace_seconds: int = 0
     calories: int
     status: str
     is_claimed: bool
@@ -658,6 +674,7 @@ class RunnerSummary(BaseModel):
     first_name: Optional[str] = None
     last_name: Optional[str] = None
     avatar_url: Optional[str] = None
+    avatar_thumb_url: Optional[str] = None
     territory_color: Optional[str] = None
     club_name: Optional[str] = None
     total_km: Optional[float] = None

@@ -22,7 +22,7 @@ NONE, FRIENDS, OUTGOING, INCOMING, SELF = "none", "friends", "outgoing_pending",
 # $1 = caller id. friendship_status / request_id for every row come from the
 # two LEFT JOINs, so a page of runners needs a single query.
 RUNNER_SUMMARY_SELECT = """
-    SELECT u.id AS user_id, u.username, u.first_name, u.last_name, u.avatar_url, u.territory_color,
+    SELECT u.id AS user_id, u.username, u.first_name, u.last_name, u.avatar_url, u.avatar_thumb_url, u.territory_color,
            u.privacy_level, c.name AS club_name,
            COALESCE((SELECT SUM(r.distance_km) FROM runs r
                       WHERE r.user_id = u.id AND r.status = 'completed'), 0) AS total_km,
@@ -57,6 +57,7 @@ def runner_summary(row, me: int, include_friends_since: bool = False) -> dict:
         "first_name": row["first_name"] if visible else None,
         "last_name": row["last_name"] if visible else None,
         "avatar_url": row["avatar_url"],
+        "avatar_thumb_url": row["avatar_thumb_url"],
         "territory_color": row["territory_color"],
         "club_name": row["club_name"] if visible else None,
         "total_km": round(row["total_km"], 1) if visible else None,

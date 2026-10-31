@@ -126,6 +126,7 @@ async def get_live_run_stats(activity_id: str, current_user: dict = Depends(get_
         "duration_seconds": duration,
         "duration_formatted": format_duration(duration),
         "pace_formatted": format_pace(pace_seconds_per_km(duration, distance_km)),
+        "pace_seconds": pace_seconds_per_km(duration, distance_km),
         "current_speed_kmh": speed_kmh,
         "points_count": count,
         "is_loop_closed": bool(is_loop_closed),

@@ -342,6 +342,7 @@ def run_summary(run: dict, badges: Optional[List[str]] = None) -> dict:
         "duration_seconds": duration,
         "duration_formatted": format_duration(duration),
         "pace_formatted": format_pace(pace_seconds_per_km(duration, run["distance_km"] or 0.0)),
+        "pace_seconds": pace_seconds_per_km(duration, run["distance_km"] or 0.0),
         "steps": run["steps"] or 0,
         "calories": run["calories"] or 0,
         "avg_speed_kmh": run["avg_speed_kmh"] or 0.0,

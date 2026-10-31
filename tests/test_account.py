@@ -7,6 +7,8 @@ import uuid
 from PIL import Image
 
 from tests.conftest import db_run, register, square_loop
+from utils import social_auth
+from utils.social_auth import SocialAuthError, SocialIdentity
 
 
 def social_login(client, provider="google", email=None):
@@ -257,9 +259,185 @@ def test_custom_base_name_survives_capture(client):
     assert claim_run(client, register(client, "next"), points)["territory_name"] == "Marina Loop"
 
 
-def test_social_account_confirms_with_the_word_delete(client):
+def test_social_account_must_prove_it_controls_the_provider_account(client):
     user = social_login(client)
     assert delete(client, user).status_code == 400
-    assert delete(client, user, confirmation="delete").status_code == 400
-    assert delete(client, user, confirmation="DELETE").status_code == 200
+    assert delete(client, user, token="t", email="someone.else@example.com").status_code == 400
+    assert client.get("/users/me", headers=user["headers"]).status_code == 200
+
+    assert delete(client, user, token="t", email=user["email"]).status_code == 200
     assert client.get("/users/me", headers=user["headers"]).status_code == 401
+
+
+def test_delete_trusts_the_signed_token_and_not_the_request_body(client, monkeypatch):
+    user = social_login(client)
+    monkeypatch.setenv("SOCIAL_LOGIN_ALLOW_UNVERIFIED", "false")
+
+    async def signed_for_someone_else(provider, token):
+        return SocialIdentity(provider, "sub", "attacker@example.com", None)
+
+    monkeypatch.setattr(social_auth, "verify_social_token", signed_for_someone_else)
+    assert delete(client, user, token="t", email=user["email"]).status_code == 400
+
+    async def signed_for_the_runner(provider, token):
+        return SocialIdentity(provider, "sub", user["email"].upper(), None)
+
+    monkeypatch.setattr(social_auth, "verify_social_token", signed_for_the_runner)
+    assert delete(client, user, token="t").status_code == 200
+
+
+def test_rejected_provider_token_is_400_so_the_app_does_not_log_out(client, monkeypatch):
+    user = social_login(client)
+    monkeypatch.setenv("SOCIAL_LOGIN_ALLOW_UNVERIFIED", "false")
+
+    async def rejected(provider, token):
+        raise SocialAuthError("Invalid Google token")
+
+    monkeypatch.setattr(social_auth, "verify_social_token", rejected)
+    assert delete(client, user, token="expired").status_code == 400
+
+
+# ---- Disconnect and reconnect
+
+def linked_account(client):
+    """A password account that has also signed in with Google."""
+    user = register(client, "apps", email=f"linked_{uuid.uuid4().hex[:8]}@example.com")
+    social_login(client, "google", email=user["payload"]["email"])
+    user["headers"] = {
+        "Authorization": f"Bearer {login(client, user, 'Password123!').json()['access_token']}"
+    }
+    return user
+
+
+def disconnect(client, user, provider="google"):
+    return client.delete(f"/api/v1/users/me/connected-apps/{provider}", headers=user["headers"])
+
+
+def test_disconnect_stops_the_provider_signing_in(client):
+    user = linked_account(client)
+    assert apps_of(client, user)["google"]["can_disconnect"] is True
+
+    response = disconnect(client, user)
+    assert response.status_code == 200, response.text
+    assert next(a for a in response.json()["apps"] if a["provider"] == "google")["connected"] is False
+
+    blocked = client.post("/auth/social-login", json={
+        "provider": "google", "token": "t", "email": user["payload"]["email"], "name": "Sam",
+    })
+    assert blocked.status_code == 403
+    assert "disconnected" in blocked.json()["detail"]
+    assert login(client, user, "Password123!").status_code == 200
+
+
+def test_reconnect_needs_a_token_for_the_same_email(client):
+    user = linked_account(client)
+    disconnect(client, user)
+    url = "/api/v1/users/me/connected-apps/google"
+    wrong = client.post(url, json={"token": "t", "email": "other@example.com"}, headers=user["headers"])
+    assert wrong.status_code == 400
+
+    right = client.post(url, json={"token": "t", "email": user["payload"]["email"]}, headers=user["headers"])
+    assert right.status_code == 200, right.text
+    assert next(a for a in right.json()["apps"] if a["provider"] == "google")["connected"] is True
+    relink = client.post("/auth/social-login", json={
+        "provider": "google", "token": "t", "email": user["payload"]["email"], "name": "Sam",
+    })
+    assert relink.status_code == 200
+
+
+def test_connect_can_add_a_provider_never_used_before(client):
+    user = register(client, "apps")
+    response = client.post("/users/me/connected-apps/apple",
+                           json={"token": "t", "email": user["payload"]["email"]}, headers=user["headers"])
+    assert response.status_code == 200
+    assert apps_of(client, user)["apple"]["connected"] is True
+
+
+def test_primary_provider_cannot_be_disconnected(client):
+    user = social_login(client, "google")
+    assert apps_of(client, user)["google"]["can_disconnect"] is False
+    assert disconnect(client, user).status_code == 400
+    assert apps_of(client, user)["google"]["connected"] is True
+
+
+def test_disconnect_errors(client):
+    user = register(client, "apps")
+    assert disconnect(client, user).status_code == 404
+    assert disconnect(client, user, "strava").status_code == 404
+    assert client.delete("/users/me/connected-apps/google").status_code == 401
+
+
+def test_deleted_account_can_sign_up_again_with_a_disconnected_provider(client):
+    user = linked_account(client)
+    disconnect(client, user)
+    delete(client, user, password="Password123!")
+    fresh = client.post("/auth/social-login", json={
+        "provider": "google", "token": "t", "email": user["payload"]["email"], "name": "Sam",
+    })
+    assert fresh.status_code == 200
+
+
+# ---- Premium colors
+
+def set_color(client, user, color):
+    return client.put("/users/identity", json={"territory_color": color}, headers=user["headers"])
+
+
+def test_premium_color_and_lookalikes_need_premium(client):
+    user = register(client, "color")
+    for color in ("#FFD700", "#ffd700", "#FFD701", "#FFDA10"):
+        response = set_color(client, user, color)
+        assert response.status_code == 403, color
+        assert response.json()["code"] == "FORBIDDEN"
+    assert client.get("/users/me", headers=user["headers"]).json()["territory_color"] == "#00E5FF"
+
+
+def test_free_colors_are_unaffected(client):
+    user = register(client, "color")
+    for color in ("#00E5FF", "#FF5722", "#123456", "#FFFF00"):
+        assert set_color(client, user, color).status_code == 200, color
+
+
+def test_premium_runner_can_use_premium_colors(client):
+    user = register(client, "color")
+    db_run("UPDATE users SET is_premium = TRUE WHERE id = $1", user["user_id"])
+    assert set_color(client, user, "#FFD700").status_code == 200
+    assert client.get("/users/me", headers=user["headers"]).json()["is_premium"] is True
+    assert client.get(f"/users/{user['user_id']}/profile").json()["is_premium"] is None
+
+
+def test_runner_already_holding_a_premium_color_keeps_it(client):
+    user = register(client, "color")
+    db_run("UPDATE users SET territory_color = '#FFD700' WHERE id = $1", user["user_id"])
+    response = client.put("/users/identity", json={"territory_color": "#FFD700", "bio": "still gold"},
+                          headers=user["headers"])
+    assert response.status_code == 200
+
+
+# ---- Raw pace for unit conversion
+
+def test_every_pace_has_a_number_next_to_the_text(client):
+    user = register(client, "pace")
+    club_id = client.get("/api/v1/clubs").json()["clubs"][0]["id"]
+    client.post(f"/api/v1/clubs/{club_id}/join", headers=user["headers"])
+    points = square_loop(size_deg=0.01)
+    activity = client.post("/api/v1/runs/start", json={"title": "Loop"}, headers=user["headers"]).json()["activity_id"]
+    client.post(f"/api/v1/runs/{activity}/telemetry", json={"activity_id": activity, "points": points},
+                headers=user["headers"])
+    db_run("UPDATE runs SET start_time = NOW() - INTERVAL '10 minutes' WHERE activity_id = $1", activity)
+    live = client.get(f"/api/v1/runs/{activity}/live", headers=user["headers"]).json()
+    assert live["pace_seconds"] > 0
+    finished = client.post(f"/api/v1/runs/{activity}/finish", json={}, headers=user["headers"]).json()
+    assert finished["pace_seconds"] > 0
+
+    def as_text(seconds):
+        return f"{seconds // 60}'{seconds % 60:02d}\""
+
+    assert as_text(finished["pace_seconds"]) == finished["pace_formatted"]
+    run = client.get(f"/users/{user['user_id']}/runs", headers=user["headers"]).json()["runs"][0]
+    assert as_text(run["pace_seconds"]) == run["pace"]
+    stats = client.get("/users/me", headers=user["headers"]).json()["stats"]
+    assert as_text(stats["avg_pace_seconds"]) == stats["avg_pace"]
+    board = client.get(f"/api/v1/clubs/{club_id}/leaderboard?limit=200", headers=user["headers"]).json()["leaderboard"]
+    mine = next(e for e in board if e["is_current_user"])
+    assert as_text(mine["avg_pace_seconds"]) == mine["avg_pace"]

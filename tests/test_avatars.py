@@ -3,6 +3,7 @@ Profile photos. Covers the test checklist in the app repo's avatar_api.md.
 """
 import io
 
+import pillow_heif
 from PIL import Image
 
 from services import avatar_service
@@ -81,6 +82,63 @@ def test_webp_is_accepted_and_non_square_is_center_cropped(client):
     assert photo.size == (512, 512)
     assert min(photo.getpixel((256, 256))) > 240
     assert min(photo.getpixel((20, 256))) > 240
+
+
+def test_heic_from_an_iphone_is_accepted(client):
+    user = register(client, "photo")
+    heif = pillow_heif.from_pillow(Image.new("RGB", (640, 480), "red"))
+    output = io.BytesIO()
+    heif.save(output, format="HEIF", quality=90)
+    response = upload(client, user, output.getvalue(), filename="IMG_0001.HEIC", content_type="image/heic")
+    assert response.status_code == 200, response.text
+    photo = served(client, response)
+    assert photo.format == "JPEG" and photo.size == (512, 512)
+    assert photo.getpixel((256, 256))[0] > 200
+
+
+def test_corrupt_heic_is_400(client):
+    user = register(client, "photo")
+    assert upload(client, user, b"\x00\x00\x00\x18ftypheic" + b"garbage" * 50).status_code == 400
+
+
+def test_thumbnail_is_served_and_replaced_with_the_photo(client):
+    user = register(client, "photo")
+    first = upload(client, user, jpeg(size=(1000, 1000), color="red")).json()
+    assert first["avatar_thumb_url"] == first["avatar_url"].replace(".jpg", "_128.jpg")
+    thumb = client.get(path_of(first["avatar_thumb_url"]))
+    assert thumb.status_code == 200
+    image = Image.open(io.BytesIO(thumb.content))
+    assert image.size == (128, 128)
+    assert len(image.getexif()) == 0
+    assert "immutable" in thumb.headers["cache-control"]
+
+    second = upload(client, user, jpeg(color="blue")).json()
+    assert client.get(path_of(first["avatar_thumb_url"])).status_code == 404
+    assert client.get(path_of(second["avatar_thumb_url"])).status_code == 200
+
+
+def test_thumbnail_reaches_lists_and_clears_with_the_photo(client):
+    user = register(client, "photo")
+    friend = register(client, "pal")
+    client.post("/api/v1/friends/requests", json={"to_user_id": friend["user_id"]}, headers=user["headers"])
+    client.post("/api/v1/friends/requests", json={"to_user_id": user["user_id"]}, headers=friend["headers"])
+    club_id = client.get("/api/v1/clubs").json()["clubs"][0]["id"]
+    client.post(f"/api/v1/clubs/{club_id}/join", headers=user["headers"])
+
+    def thumbs():
+        board = client.get(f"/api/v1/clubs/{club_id}/leaderboard?limit=200").json()["leaderboard"]
+        return {
+            client.get("/users/me", headers=user["headers"]).json()["avatar_thumb_url"],
+            client.get("/api/v1/friends", headers=friend["headers"]).json()["friends"][0]["avatar_thumb_url"] or "",
+            next(e for e in board if e["user_id"] == str(user["user_id"]))["avatar_thumb_url"],
+        }
+
+    url = upload(client, user, jpeg()).json()["avatar_thumb_url"]
+    assert thumbs() == {url}
+
+    client.put("/users/identity", json={"avatar_url": "https://example.com/me.png"}, headers=user["headers"])
+    assert thumbs() == {""}
+    assert client.get(path_of(url)).status_code == 404
 
 
 def test_oversized_upload_is_rejected(client):

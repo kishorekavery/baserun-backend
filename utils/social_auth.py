@@ -12,6 +12,7 @@ Env:
                                        request body (never enable in production)
 """
 import asyncio
+import hashlib
 import os
 from dataclasses import dataclass
 from typing import List, Optional
@@ -96,3 +97,20 @@ async def verify_social_token(provider: str, token: str) -> SocialIdentity:
     if provider == "apple":
         return await _verify_apple(token)
     raise SocialAuthError("Unsupported social provider")
+
+
+async def resolve_identity(
+    provider: str, token: str, claimed_email: Optional[str] = None, claimed_name: Optional[str] = None
+) -> SocialIdentity:
+    """
+    The identity an account is matched on, with its email lowercased. Accounts
+    with no provider email get a stable synthetic one. The claimed values are
+    only trusted in local development; in production the signed token decides.
+    """
+    if allow_unverified():
+        token_hash = hashlib.sha256(token.encode()).hexdigest()[:16]
+        email = claimed_email or f"{provider}_{token_hash}@social.baserun.app"
+        return SocialIdentity(provider, token_hash, email.lower(), claimed_name)
+    identity = await verify_social_token(provider, token)
+    email = identity.email or f"{provider}_{identity.subject}@social.baserun.app"
+    return SocialIdentity(provider, identity.subject, email.lower(), identity.name or claimed_name)

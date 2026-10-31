@@ -11,23 +11,28 @@ import asyncio
 import io
 import os
 import uuid
-from typing import Optional
+from typing import Optional, Tuple
 
+import pillow_heif
 from fastapi import HTTPException, Request
 from PIL import Image, ImageOps
 from starlette.datastructures import UploadFile
 
 from db.database import connection, transaction
 
+pillow_heif.register_heif_opener()
+
 MAX_FILE_BYTES = 5 * 1024 * 1024
 MAX_BODY_BYTES = MAX_FILE_BYTES + 64 * 1024  # room for the multipart framing
 MAX_PIXELS = 25_000_000
 AVATAR_SIZE = 512
+THUMB_SIZE = 128
 JPEG_QUALITY = 82
+HEIF_BRANDS = {b"heic", b"heix", b"hevc", b"hevx", b"heim", b"heis", b"mif1", b"msf1"}
 MAX_UPLOADS_PER_HOUR = 10
-# Immutable because each upload gets a new key. The CDN keeps a copy for a day
+# Immutable because each upload gets a new key. The CDN keeps a copy for an hour
 # only, so a removed photo or deleted account stops being served soon after.
-CACHE_CONTROL = "public, max-age=31536000, s-maxage=86400, immutable"
+CACHE_CONTROL = "public, max-age=31536000, s-maxage=3600, immutable"
 
 
 def _too_large() -> HTTPException:
@@ -68,11 +73,19 @@ def sniff_image_type(data: bytes) -> Optional[str]:
         return "PNG"
     if data[:4] == b"RIFF" and data[8:12] == b"WEBP":
         return "WEBP"
+    if data[4:8] == b"ftyp" and data[8:12] in HEIF_BRANDS:
+        return "HEIF"
     return None
 
 
-def normalize_image(data: bytes, kind: str) -> bytes:
-    """Upright, center-cropped, white-backed AVATAR_SIZE JPEG with no metadata."""
+def _jpeg(image: Image.Image) -> bytes:
+    output = io.BytesIO()
+    image.save(output, format="JPEG", quality=JPEG_QUALITY, optimize=True)
+    return output.getvalue()
+
+
+def normalize_image(data: bytes, kind: str) -> Tuple[bytes, bytes]:
+    """Upright, center-cropped, white-backed JPEGs with no metadata: (full size, thumbnail)."""
     try:
         with Image.open(io.BytesIO(data), formats=(kind,)) as image:
             # Checked before decoding: a tiny file can expand to gigabytes of pixels
@@ -85,9 +98,7 @@ def normalize_image(data: bytes, kind: str) -> bytes:
     flattened = Image.new("RGBA", upright.size, "white")
     flattened.alpha_composite(upright)
     square = ImageOps.fit(flattened.convert("RGB"), (AVATAR_SIZE, AVATAR_SIZE), Image.Resampling.LANCZOS)
-    output = io.BytesIO()
-    square.save(output, format="JPEG", quality=JPEG_QUALITY, optimize=True)
-    return output.getvalue()
+    return _jpeg(square), _jpeg(square.resize((THUMB_SIZE, THUMB_SIZE), Image.Resampling.LANCZOS))
 
 
 def public_base_url(request: Request) -> str:
@@ -102,7 +113,7 @@ async def upload_avatar(request: Request, user_id: int) -> None:
     data = await read_upload(request)
     kind = sniff_image_type(data)
     if kind is None:
-        raise HTTPException(status_code=415, detail="Photo must be a JPEG, PNG or WebP image")
+        raise HTTPException(status_code=415, detail="Photo must be a JPEG, PNG, WebP or HEIC image")
 
     async with connection() as conn:
         recent = await conn.fetchval(
@@ -112,19 +123,22 @@ async def upload_avatar(request: Request, user_id: int) -> None:
     if recent >= MAX_UPLOADS_PER_HOUR:
         raise HTTPException(status_code=429, detail="Too many photo uploads, please try again later")
 
-    jpeg = await asyncio.to_thread(normalize_image, data, kind)  # CPU bound
+    full, thumb = await asyncio.to_thread(normalize_image, data, kind)  # CPU bound
     key = uuid.uuid4().hex
-    url = f"{public_base_url(request)}/api/v1/avatars/{key}.jpg"
+    base = f"{public_base_url(request)}/api/v1/avatars/{key}"
     async with transaction() as conn:
         await conn.execute(
             """
-            INSERT INTO avatars (user_id, key, data) VALUES ($1, $2, $3)
+            INSERT INTO avatars (user_id, key, data, thumb) VALUES ($1, $2, $3, $4)
             ON CONFLICT (user_id) DO UPDATE
-            SET key = EXCLUDED.key, data = EXCLUDED.data, created_at = NOW()
+            SET key = EXCLUDED.key, data = EXCLUDED.data, thumb = EXCLUDED.thumb, created_at = NOW()
             """,
-            user_id, key, jpeg,
+            user_id, key, full, thumb,
         )
-        await conn.execute("UPDATE users SET avatar_url = $2 WHERE id = $1", user_id, url)
+        await conn.execute(
+            "UPDATE users SET avatar_url = $2, avatar_thumb_url = $3 WHERE id = $1",
+            user_id, f"{base}.jpg", f"{base}_128.jpg",
+        )
         await conn.execute("INSERT INTO avatar_uploads (user_id) VALUES ($1)", user_id)
         await conn.execute(
             "DELETE FROM avatar_uploads WHERE user_id = $1 AND created_at < NOW() - INTERVAL '1 hour'", user_id
@@ -134,9 +148,10 @@ async def upload_avatar(request: Request, user_id: int) -> None:
 async def remove_avatar(user_id: int) -> None:
     async with transaction() as conn:
         await conn.execute("DELETE FROM avatars WHERE user_id = $1", user_id)
-        await conn.execute("UPDATE users SET avatar_url = NULL WHERE id = $1", user_id)
+        await conn.execute("UPDATE users SET avatar_url = NULL, avatar_thumb_url = NULL WHERE id = $1", user_id)
 
 
-async def get_avatar_image(key: str) -> Optional[bytes]:
+async def get_avatar_image(key: str, thumbnail: bool = False) -> Optional[bytes]:
+    column = "thumb" if thumbnail else "data"
     async with connection() as conn:
-        return await conn.fetchval("SELECT data FROM avatars WHERE key = $1", key)
+        return await conn.fetchval(f"SELECT {column} FROM avatars WHERE key = $1", key)

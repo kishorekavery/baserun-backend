@@ -362,6 +362,7 @@ Tests need a disposable PostgreSQL database (its name must contain `test`; the s
 
 ```bash
 createdb baserun_test
+./.venv/bin/pip install -r requirements-dev.txt
 TEST_DATABASE_URL=postgresql://postgres@localhost:5432/baserun_test ./.venv/bin/pytest
 ```
 

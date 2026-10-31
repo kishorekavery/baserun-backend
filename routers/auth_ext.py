@@ -1,4 +1,3 @@
-import hashlib
 import logging
 import re
 import secrets
@@ -22,7 +21,7 @@ from models.datamodel import (
 from routers import core
 from routers.core import build_auth_response, get_current_user, hash_password, verify_password
 from utils.helper import is_valid_username
-from utils.social_auth import SocialAuthError, allow_unverified, verify_social_token
+from utils.social_auth import SocialAuthError, resolve_identity
 
 logger = logging.getLogger("baserun.auth")
 
@@ -119,22 +118,23 @@ async def social_login(request: SocialLoginRequest):
     if request.provider not in SUPPORTED_PROVIDERS:
         raise HTTPException(status_code=400, detail="Unsupported social provider")
 
-    if allow_unverified():
-        token_hash = hashlib.sha256(request.token.encode()).hexdigest()[:16]
-        email = request.email or f"{request.provider}_{token_hash}@social.baserun.app"
-        name = request.name
-    else:
-        try:
-            identity = await verify_social_token(request.provider, request.token)
-        except SocialAuthError as exc:
-            raise HTTPException(status_code=401, detail=str(exc))
-        email = identity.email or f"{request.provider}_{identity.subject}@social.baserun.app"
-        name = identity.name or request.name
-    email = email.lower()
+    try:
+        identity = await resolve_identity(request.provider, request.token, request.email, request.name)
+    except SocialAuthError as exc:
+        raise HTTPException(status_code=401, detail=str(exc))
+    email, name = identity.email, identity.name
 
     async with connection() as conn:
         user_id = await conn.fetchval("SELECT id FROM users WHERE LOWER(email) = $1", email)
         is_new = user_id is None
+        if not is_new and await conn.fetchval(
+            "SELECT disconnected_at IS NOT NULL FROM connected_accounts WHERE user_id = $1 AND provider = $2",
+            user_id, request.provider,
+        ):
+            raise HTTPException(
+                status_code=403,
+                detail=f"{request.provider.title()} was disconnected from this account. Sign in with your password.",
+            )
         if is_new:
             base = _username_base(name, request.provider)
             random_password = await hash_password(secrets.token_hex(32))

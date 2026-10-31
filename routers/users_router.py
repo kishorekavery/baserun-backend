@@ -8,6 +8,7 @@ from models.datamodel import (
     AccountActionResponse,
     AchievementsResponse,
     BaseListResponse,
+    ConnectAppRequest,
     ConnectedAppsResponse,
     DeleteAccountRequest,
     FullUserProfileResponse,
@@ -18,13 +19,15 @@ from models.datamodel import (
 from routers.core import USER_PROFILE_SQL, get_current_user, get_current_user_optional, verify_ownership, verify_password
 from services import account_service, avatar_service, privacy
 from services.club_service import set_user_club
+from services.colors import is_premium_color
 from services.territory_service import TERRITORY_SELECT, base_item
 from utils.helper import format_duration, format_pace, iso, pace_seconds_per_km
+from utils.social_auth import SocialAuthError, resolve_identity
 
 router = APIRouter(prefix="/users", tags=["users"])
 avatar_images_router = APIRouter(prefix="/api/v1/avatars", tags=["users"])
 
-SOCIAL_PROVIDERS = (("google", "Google"), ("apple", "Apple"))
+SOCIAL_PROVIDERS = {"google": "Google", "apple": "Apple"}
 
 
 def _restricted_profile(user) -> dict:
@@ -34,6 +37,7 @@ def _restricted_profile(user) -> dict:
         "username": user["username"],
         "first_name": user["username"],
         "avatar_url": user["avatar_url"] or "",
+        "avatar_thumb_url": user["avatar_thumb_url"] or "",
         "city": "",
         "territory_color": user["territory_color"],
         "total_territories": 0,
@@ -45,7 +49,8 @@ def _restricted_profile(user) -> dict:
             "total_duration_hours": 0,
             "bases_claimed": 0,
             "bases_held": 0,
-            "avg_pace": format_pace(pace_seconds_per_km(0, 0)),
+            "avg_pace": format_pace(0),
+            "avg_pace_seconds": 0,
         },
         "is_restricted": True,
     }
@@ -88,6 +93,7 @@ async def _build_full_profile(user_id: int, viewer_id: Optional[int]) -> dict:
         "first_name": user["first_name"],
         "last_name": user["last_name"],
         "avatar_url": user["avatar_url"] or "",
+        "avatar_thumb_url": user["avatar_thumb_url"] or "",
         "bio": user["bio"],
         "city": user["city"] or "",
         "territory_color": user["territory_color"],
@@ -104,9 +110,11 @@ async def _build_full_profile(user_id: int, viewer_id: Optional[int]) -> dict:
             "bases_claimed": runs["bases_claimed"],
             "bases_held": bases_held,
             "avg_pace": format_pace(pace_seconds_per_km(runs["total_seconds"], runs["total_km"])),
+            "avg_pace_seconds": pace_seconds_per_km(runs["total_seconds"], runs["total_km"]),
         },
         "privacy_level": user["privacy_level"] if is_self else None,
         "auth_provider": user["auth_provider"] if is_self else None,
+        "is_premium": user["is_premium"] if is_self else None,
     }
 
 
@@ -118,6 +126,7 @@ async def _identity_response(user_id: int, message: str) -> dict:
         "username": user["username"],
         "territory_color": user["territory_color"],
         "avatar_url": user["avatar_url"] or "",
+        "avatar_thumb_url": user["avatar_thumb_url"] or "",
         "bio": user["bio"],
         "club_id": user["club_id"],
         "club_name": user["club_name"],
@@ -127,6 +136,11 @@ async def _identity_response(user_id: int, message: str) -> dict:
 
 
 async def _update_identity(user: dict, request: UpdateIdentityRequest) -> dict:
+    color = request.territory_color
+    # A runner who already holds a premium color keeps it
+    if color and color != user["territory_color"] and is_premium_color(color) and not user["is_premium"]:
+        raise HTTPException(status_code=403, detail="That is a premium color")
+
     fields = request.model_fields_set
     updates = {}
     if request.username is not None and request.username != user["username"]:
@@ -135,6 +149,9 @@ async def _update_identity(user: dict, request: UpdateIdentityRequest) -> dict:
         value = getattr(request, column)
         if value is not None:
             updates[column] = value.strip() if isinstance(value, str) else value
+    replaces_photo = "avatar_url" in updates and updates["avatar_url"] != user["avatar_url"]
+    if replaces_photo:
+        updates["avatar_thumb_url"] = None
 
     async with transaction() as conn:
         if updates:
@@ -143,7 +160,7 @@ async def _update_identity(user: dict, request: UpdateIdentityRequest) -> dict:
                 await conn.execute(f"UPDATE users SET {assignments} WHERE id = $1", user["id"], *updates.values())
             except asyncpg.UniqueViolationError:
                 raise HTTPException(status_code=400, detail="Username is already taken")
-        if "avatar_url" in updates and updates["avatar_url"] != user["avatar_url"]:
+        if replaces_photo:
             await conn.execute("DELETE FROM avatars WHERE user_id = $1", user["id"])  # replaced by a plain URL
         # club_id: a value joins that club, an explicit null leaves the current club
         if "club_id" in fields and request.club_id != user["club_id"]:
@@ -201,12 +218,7 @@ async def remove_avatar(current_user: dict = Depends(get_current_user)):
     return await _identity_response(current_user["id"], "Profile photo removed")
 
 
-@avatar_images_router.get("/{key}.jpg")
-async def get_avatar_image(key: str):
-    """
-    Public image bytes behind avatar_url. Keys are random and change on every upload.
-    """
-    data = await avatar_service.get_avatar_image(key)
+def _image_response(data: Optional[bytes]) -> Response:
     if data is None:
         raise HTTPException(status_code=404, detail="Photo not found")
     return Response(
@@ -216,30 +228,113 @@ async def get_avatar_image(key: str):
     )
 
 
+@avatar_images_router.get("/{key}_128.jpg")
+async def get_avatar_thumbnail(key: str):
+    """
+    Public image bytes behind avatar_thumb_url. Registered first: `{key}` would also match "abc_128".
+    """
+    return _image_response(await avatar_service.get_avatar_image(key, thumbnail=True))
+
+
+@avatar_images_router.get("/{key}.jpg")
+async def get_avatar_image(key: str):
+    """
+    Public image bytes behind avatar_url. Keys are random and change on every upload.
+    """
+    return _image_response(await avatar_service.get_avatar_image(key))
+
+
+async def _connected_apps(user: dict) -> dict:
+    async with connection() as conn:
+        rows = await conn.fetch(
+            "SELECT provider, connected_at FROM connected_accounts WHERE user_id = $1 AND disconnected_at IS NULL",
+            user["id"],
+        )
+    connected_at = {r["provider"]: r["connected_at"] for r in rows}
+    primary = user["auth_provider"]
+    apps = []
+    for provider, name in SOCIAL_PROVIDERS.items():
+        # Accounts created before connected_accounts existed have no row
+        connected = provider in connected_at or provider == primary
+        apps.append({
+            "provider": provider,
+            "name": name,
+            "connected": connected,
+            "connected_at": iso(connected_at.get(provider)),
+            "is_primary": provider == primary,
+            "can_disconnect": connected and provider != primary,
+        })
+    return {"apps": apps}
+
+
+def _provider_name(provider: str) -> str:
+    if provider not in SOCIAL_PROVIDERS:
+        raise HTTPException(status_code=404, detail="Unknown provider")
+    return SOCIAL_PROVIDERS[provider]
+
+
+async def _require_provider_proof(user: dict, provider: str, token: Optional[str], email: Optional[str]) -> None:
+    """
+    Proves the caller controls the provider account, not just this session.
+    Failures are 400, not 401: the app logs the runner out on a 401.
+    """
+    name = _provider_name(provider)
+    if not token:
+        raise HTTPException(status_code=400, detail=f"Sign in with {name} again to confirm")
+    try:
+        identity = await resolve_identity(provider, token, email)
+    except SocialAuthError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    if identity.email != user["email"].lower():
+        raise HTTPException(status_code=400, detail=f"That {name} account does not match this profile")
+
+
 @router.get("/me/connected-apps", response_model=ConnectedAppsResponse)
 async def get_connected_apps(current_user: dict = Depends(get_current_user)):
     """
     Edit Profile: the social sign-ins connected to this account.
     """
+    return await _connected_apps(current_user)
+
+
+@router.post("/me/connected-apps/{provider}", response_model=ConnectedAppsResponse)
+async def connect_app(provider: str, request: ConnectAppRequest, current_user: dict = Depends(get_current_user)):
+    """
+    Edit Profile: connect a provider, or reconnect one disconnected earlier,
+    using a fresh ID token for the same email as this account.
+    """
+    await _require_provider_proof(current_user, provider, request.token, request.email)
     async with connection() as conn:
-        rows = await conn.fetch(
-            "SELECT provider, connected_at FROM connected_accounts WHERE user_id = $1", current_user["id"]
+        await conn.execute(
+            """
+            INSERT INTO connected_accounts (user_id, provider) VALUES ($1, $2)
+            ON CONFLICT (user_id, provider) DO UPDATE SET disconnected_at = NULL, connected_at = NOW()
+            """,
+            current_user["id"], provider,
         )
-    connected_at = {r["provider"]: r["connected_at"] for r in rows}
-    primary = current_user["auth_provider"]
-    return {
-        "apps": [
-            {
-                "provider": provider,
-                "name": name,
-                # Accounts created before connected_accounts existed have no row
-                "connected": provider in connected_at or provider == primary,
-                "connected_at": iso(connected_at.get(provider)),
-                "is_primary": provider == primary,
-            }
-            for provider, name in SOCIAL_PROVIDERS
-        ]
-    }
+    return await _connected_apps(current_user)
+
+
+@router.delete("/me/connected-apps/{provider}", response_model=ConnectedAppsResponse)
+async def disconnect_app(provider: str, current_user: dict = Depends(get_current_user)):
+    """
+    Edit Profile: stop a provider signing in to this account. The provider the
+    account was created with can't be removed: nothing else could sign in.
+    """
+    name = _provider_name(provider)
+    if provider == current_user["auth_provider"]:
+        raise HTTPException(status_code=400, detail=f"{name} is how you sign in, so it can't be disconnected")
+    async with connection() as conn:
+        result = await conn.execute(
+            """
+            UPDATE connected_accounts SET disconnected_at = NOW()
+            WHERE user_id = $1 AND provider = $2 AND disconnected_at IS NULL
+            """,
+            current_user["id"], provider,
+        )
+    if result == "UPDATE 0":
+        raise HTTPException(status_code=404, detail=f"{name} is not connected")
+    return await _connected_apps(current_user)
 
 
 @router.post("/me/delete", response_model=AccountActionResponse)
@@ -254,8 +349,8 @@ async def delete_my_account(request: DeleteAccountRequest, current_user: dict = 
             hashed = await conn.fetchval("SELECT hashed_password FROM users WHERE id = $1", current_user["id"])
         if not request.password or not await verify_password(request.password, hashed):
             raise HTTPException(status_code=400, detail="Password is incorrect")
-    elif request.confirmation != "DELETE":
-        raise HTTPException(status_code=400, detail='Send confirmation "DELETE" to delete this account')
+    else:
+        await _require_provider_proof(current_user, current_user["auth_provider"], request.token, request.email)
 
     await account_service.delete_account(current_user["id"])
     return {"status": "success", "message": "Account deleted"}
@@ -337,6 +432,7 @@ async def get_user_runs(
             "duration": format_duration(r["duration_seconds"]),
             "duration_seconds": r["duration_seconds"],
             "pace": format_pace(pace_seconds_per_km(r["duration_seconds"], r["distance_km"])),
+            "pace_seconds": pace_seconds_per_km(r["duration_seconds"], r["distance_km"]),
             "calories": r["calories"],
             "status": r["status"],
             "is_claimed": r["is_claimed"],

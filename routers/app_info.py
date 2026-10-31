@@ -3,7 +3,8 @@ import os
 from fastapi import APIRouter
 
 from db.database import DEFAULT_SEASON, connection
-from models.datamodel import AppConfigResponse, ColorPaletteResponse, ColorPaletteItem
+from models.datamodel import AppConfigResponse, ColorPaletteResponse
+from services.colors import COLOR_PALETTE
 from utils.helper import iso, utcnow
 
 router = APIRouter(prefix="/api/v1/app", tags=["app"])
@@ -11,15 +12,6 @@ router = APIRouter(prefix="/api/v1/app", tags=["app"])
 APP_NAME = "BASER"
 TAGLINE = "Turn Your Miles into Territory"
 WELCOME_QUOTE = "Run. Explore. Claim. Belong."
-
-COLOR_PALETTE = [
-    ColorPaletteItem(name="Electric Cyan", hex="#00E5FF"),
-    ColorPaletteItem(name="Neon Lime", hex="#76FF03"),
-    ColorPaletteItem(name="Hot Magenta", hex="#FF007F"),
-    ColorPaletteItem(name="Cyber Purple", hex="#7928CA"),
-    ColorPaletteItem(name="Blaze Orange", hex="#FF5722"),
-    ColorPaletteItem(name="Blaze Gold", hex="#FFD700", is_premium=True),
-]
 
 
 def _env_flag(name: str) -> bool:

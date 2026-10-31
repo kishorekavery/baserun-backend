@@ -138,7 +138,7 @@ def test_social_login_reuses_account(client):
 
 
 def test_social_login_uses_verified_identity(client, monkeypatch):
-    from routers import auth_ext
+    from utils import social_auth
     from utils.social_auth import SocialAuthError, SocialIdentity
 
     monkeypatch.setenv("SOCIAL_LOGIN_ALLOW_UNVERIFIED", "false")
@@ -147,7 +147,7 @@ def test_social_login_uses_verified_identity(client, monkeypatch):
     async def reject(provider, token):
         raise SocialAuthError("Invalid Google token")
 
-    monkeypatch.setattr(auth_ext, "verify_social_token", reject)
+    monkeypatch.setattr(social_auth, "verify_social_token", reject)
     res = client.post("/auth/social-login", json={
         "provider": "google", "token": "forged", "email": victim["payload"]["email"],
     })
@@ -159,7 +159,7 @@ def test_social_login_uses_verified_identity(client, monkeypatch):
     async def accept(provider, token):
         return SocialIdentity("google", "sub-123", verified_email, "Verified Runner")
 
-    monkeypatch.setattr(auth_ext, "verify_social_token", accept)
+    monkeypatch.setattr(social_auth, "verify_social_token", accept)
     res = client.post("/auth/social-login", json={
         "provider": "google", "token": "real", "email": victim["payload"]["email"],
     })

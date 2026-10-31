@@ -115,7 +115,7 @@ async def get_club_leaderboard(
             raise HTTPException(status_code=404, detail="Club not found")
         rows = await conn.fetch(
             """
-            SELECT u.id, u.username, u.avatar_url, u.privacy_level,
+            SELECT u.id, u.username, u.avatar_url, u.avatar_thumb_url, u.privacy_level,
                    (SELECT count(*) FROM territories t
                      WHERE t.owner_id = u.id AND t.club_id = $1 AND t.status = 'active') AS territories_held,
                    COALESCE(rs.total_km, 0) AS total_km,
@@ -147,11 +147,13 @@ async def get_club_leaderboard(
             "username": name,
             "runner_name": name,
             "avatar_url": avatar,
+            "avatar_thumb_url": (r["avatar_thumb_url"] or "") if visible else "",
             "runner_avatar": avatar,
             "territories": r["territories_held"],
             "territories_held": r["territories_held"],
             "total_km": round(r["total_km"], 1),
             "avg_pace": format_pace(pace_seconds_per_km(r["total_seconds"], r["total_km"])),
+            "avg_pace_seconds": pace_seconds_per_km(r["total_seconds"], r["total_km"]),
             "is_current_user": visible and r["id"] == viewer_id,
         })
     return {
