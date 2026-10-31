@@ -11,6 +11,7 @@ from models.datamodel import (
     ClubMembershipResponse,
 )
 from routers.core import get_current_user, get_current_user_optional
+from services import privacy
 from services.club_service import CLUB_STATS_SELECT, club_item, set_user_club
 from services.territory_service import TERRITORY_SELECT, base_item
 from utils.helper import format_pace, pace_seconds_per_km
@@ -21,7 +22,8 @@ router = APIRouter(prefix="/api/v1/clubs", tags=["clubs"])
 async def _viewer_club_id(conn, current_user: Optional[dict], user_id: Optional[int]) -> Optional[int]:
     if current_user:
         return current_user["club_id"]
-    if user_id is not None:
+    # The legacy parameter is unverified: it must not reveal a hidden runner's club
+    if user_id is not None and await privacy.is_visible(conn, user_id, None):
         return await conn.fetchval("SELECT club_id FROM users WHERE id = $1", user_id)
     return None
 
@@ -106,13 +108,14 @@ async def get_club_leaderboard(
     Screen 11: club members ranked by bases held, then kilometres run.
     """
     viewer_id = current_user["id"] if current_user else current_user_id
+    token_viewer_id = current_user["id"] if current_user else None
     async with connection() as conn:
         club = await conn.fetchrow(CLUB_STATS_SELECT + " WHERE c.id = $1", club_id)
         if not club:
             raise HTTPException(status_code=404, detail="Club not found")
         rows = await conn.fetch(
             """
-            SELECT u.id, u.username, u.avatar_url,
+            SELECT u.id, u.username, u.avatar_url, u.privacy_level,
                    (SELECT count(*) FROM territories t
                      WHERE t.owner_id = u.id AND t.club_id = $1 AND t.status = 'active') AS territories_held,
                    COALESCE(rs.total_km, 0) AS total_km,
@@ -128,22 +131,28 @@ async def get_club_leaderboard(
             """,
             club_id, limit,
         )
+        friends = await privacy.friends_among(
+            conn, token_viewer_id, [r["id"] for r in rows if r["privacy_level"] != privacy.PUBLIC]
+        )
 
     leaderboard = []
     for rank, r in enumerate(rows, start=1):
-        avatar = r["avatar_url"] or ""
+        # Hidden runners keep their rank and totals, which then belong to nobody in particular
+        visible = privacy.can_view(r["privacy_level"], r["id"], token_viewer_id, r["id"] in friends)
+        avatar = (r["avatar_url"] or "") if visible else ""
+        name = r["username"] if visible else privacy.PRIVATE_RUNNER
         leaderboard.append({
             "rank": rank,
-            "user_id": str(r["id"]),
-            "username": r["username"],
-            "runner_name": r["username"],
+            "user_id": str(r["id"]) if visible else "",
+            "username": name,
+            "runner_name": name,
             "avatar_url": avatar,
             "runner_avatar": avatar,
             "territories": r["territories_held"],
             "territories_held": r["territories_held"],
             "total_km": round(r["total_km"], 1),
             "avg_pace": format_pace(pace_seconds_per_km(r["total_seconds"], r["total_km"])),
-            "is_current_user": viewer_id is not None and r["id"] == viewer_id,
+            "is_current_user": visible and r["id"] == viewer_id,
         })
     return {
         "club_id": club["id"],
@@ -155,7 +164,7 @@ async def get_club_leaderboard(
 
 
 @router.get("/{club_id}/territories", response_model=BaseListResponse)
-async def get_club_territories(club_id: int):
+async def get_club_territories(club_id: int, current_user: Optional[dict] = Depends(get_current_user_optional)):
     """
     Screen 11: active territories held by a club.
     """
@@ -163,4 +172,5 @@ async def get_club_territories(club_id: int):
         rows = await conn.fetch(
             TERRITORY_SELECT + " WHERE t.club_id = $1 AND t.status = 'active' ORDER BY t.id DESC", club_id
         )
+        rows = await privacy.mask_territories(conn, rows, current_user["id"] if current_user else None)
     return {"total": len(rows), "bases": [base_item(r) for r in rows]}

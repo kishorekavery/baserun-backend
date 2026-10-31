@@ -335,6 +335,8 @@ geodesics and stored as WKT plus a bounding box, so PostGIS is not required.
 7. `clubs` — running clubs; member/territory/area totals are aggregated live.
 8. `achievements` / `user_achievements` — badge catalog and unlocks.
 9. `seasons` — current season shown on the splash screen.
+10. `avatars` / `avatar_uploads` — profile photos (one 512 px JPEG per runner) and the hourly upload log.
+11. `connected_accounts` — Google and Apple sign-ins used on an account.
 
 A database created by the old code base is not modified destructively: its tables are renamed to
 `legacy_<name>` the first time the new schema is applied.

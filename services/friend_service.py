@@ -11,6 +11,7 @@ from fastapi import HTTPException
 
 from db.database import connection, transaction
 from models.datamodel import SendFriendRequest
+from services import privacy
 from utils.helper import iso
 
 MAX_PENDING_OUTGOING = 50
@@ -22,7 +23,7 @@ NONE, FRIENDS, OUTGOING, INCOMING, SELF = "none", "friends", "outgoing_pending",
 # two LEFT JOINs, so a page of runners needs a single query.
 RUNNER_SUMMARY_SELECT = """
     SELECT u.id AS user_id, u.username, u.first_name, u.last_name, u.avatar_url, u.territory_color,
-           c.name AS club_name,
+           u.privacy_level, c.name AS club_name,
            COALESCE((SELECT SUM(r.distance_km) FROM runs r
                       WHERE r.user_id = u.id AND r.status = 'completed'), 0) AS total_km,
            (SELECT count(*) FROM territories t WHERE t.owner_id = u.id AND t.status = 'active') AS bases_held,
@@ -49,16 +50,17 @@ def _status(row, me: int) -> str:
 
 def runner_summary(row, me: int, include_friends_since: bool = False) -> dict:
     status = _status(row, me)
+    visible = privacy.can_view(row["privacy_level"], row["user_id"], me, status == FRIENDS)
     return {
         "user_id": row["user_id"],
         "username": row["username"],
-        "first_name": row["first_name"],
-        "last_name": row["last_name"],
+        "first_name": row["first_name"] if visible else None,
+        "last_name": row["last_name"] if visible else None,
         "avatar_url": row["avatar_url"],
         "territory_color": row["territory_color"],
-        "club_name": row["club_name"],
-        "total_km": round(row["total_km"], 1),
-        "bases_held": row["bases_held"],
+        "club_name": row["club_name"] if visible else None,
+        "total_km": round(row["total_km"], 1) if visible else None,
+        "bases_held": row["bases_held"] if visible else None,
         "friendship_status": status,
         "request_id": row["request_id"] if status in (OUTGOING, INCOMING) else None,
         "friends_since": iso(row["friends_since"]) if include_friends_since else None,
@@ -77,11 +79,16 @@ async def search_runners(me: int, query: str, limit: int) -> dict:
     async with connection() as conn:
         rows = await conn.fetch(
             RUNNER_SUMMARY_SELECT + """
-            WHERE u.is_active AND (
+            WHERE u.is_active
+              AND (u.privacy_level <> 'private' OR f.user_id IS NOT NULL OR u.id = $1)
+              AND (
                 LOWER(u.username) LIKE '%' || $2 || '%'
-                OR LOWER(u.first_name) LIKE '%' || $2 || '%'
-                OR LOWER(COALESCE(u.last_name, '')) LIKE '%' || $2 || '%'
-            )
+                -- Matching a hidden real name would confirm who is behind a username
+                OR ((u.privacy_level = 'public' OR f.user_id IS NOT NULL OR u.id = $1) AND (
+                    LOWER(u.first_name) LIKE '%' || $2 || '%'
+                    OR LOWER(COALESCE(u.last_name, '')) LIKE '%' || $2 || '%'
+                ))
+              )
             ORDER BY (LOWER(u.username) = $3) DESC,
                      (f.user_id IS NOT NULL) DESC,
                      (LOWER(u.username) LIKE $2 || '%') DESC,

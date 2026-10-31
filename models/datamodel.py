@@ -1,7 +1,7 @@
 from __future__ import annotations
 from enum import Enum
 from datetime import datetime
-from typing import List, Optional
+from typing import List, Literal, Optional
 from pydantic import BaseModel, Field, EmailStr, AliasChoices, field_validator, model_validator
 
 from utils.helper import HEX_COLOR_RE, USERNAME_RE
@@ -270,6 +270,7 @@ class UpdateIdentityRequest(BaseModel):
     last_name: Optional[str] = Field(None, max_length=64)
     city: Optional[str] = Field(None, max_length=120)
     club_id: Optional[int] = Field(None, description="Join this club; send null explicitly to leave your club")
+    privacy_level: Optional[Literal["public", "friends", "private"]] = None
 
     check_username = field_validator("username")(_validate_username)
     check_color = field_validator("territory_color")(_validate_hex_color)
@@ -283,7 +284,35 @@ class IdentityResponse(BaseModel):
     bio: Optional[str] = None
     club_id: Optional[int] = None
     club_name: Optional[str] = None
+    privacy_level: Optional[str] = None
     message: str
+
+
+class ChangePasswordRequest(BaseModel):
+    current_password: str = Field(..., min_length=1, max_length=128)
+    new_password: str = Field(..., min_length=6, max_length=128)
+
+
+class AccountActionResponse(BaseModel):
+    status: str = "success"
+    message: str
+
+
+class DeleteAccountRequest(BaseModel):
+    password: Optional[str] = Field(None, max_length=128, description="Required for password accounts")
+    confirmation: Optional[str] = Field(None, description='Social accounts have no password: send "DELETE"')
+
+
+class ConnectedApp(BaseModel):
+    provider: str
+    name: str
+    connected: bool
+    connected_at: Optional[str] = None
+    is_primary: bool = Field(..., description="The account was created with this provider")
+
+
+class ConnectedAppsResponse(BaseModel):
+    apps: List[ConnectedApp]
 
 
 # ==========================================
@@ -577,6 +606,9 @@ class FullUserProfileResponse(BaseModel):
     club_name: Optional[str] = None
     favorite_base: Optional[str] = None
     stats: UserStats
+    is_restricted: bool = Field(False, description="True when privacy settings hide this runner's details from the viewer")
+    privacy_level: Optional[str] = Field(None, description="Only returned to the runner themselves")
+    auth_provider: Optional[str] = Field(None, description="password | google | apple; only returned to the runner themselves")
 
 
 class RunHistoryItem(BaseModel):

@@ -1,32 +1,64 @@
 from typing import Optional
 
 import asyncpg
-from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response
 
 from db.database import connection, transaction
 from models.datamodel import (
+    AccountActionResponse,
     AchievementsResponse,
     BaseListResponse,
+    ConnectedAppsResponse,
+    DeleteAccountRequest,
     FullUserProfileResponse,
     IdentityResponse,
     RunHistoryResponse,
     UpdateIdentityRequest,
 )
-from routers.core import USER_PROFILE_SQL, get_current_user, get_current_user_optional, verify_ownership
+from routers.core import USER_PROFILE_SQL, get_current_user, get_current_user_optional, verify_ownership, verify_password
+from services import account_service, avatar_service, privacy
 from services.club_service import set_user_club
 from services.territory_service import TERRITORY_SELECT, base_item
 from utils.helper import format_duration, format_pace, iso, pace_seconds_per_km
 
 router = APIRouter(prefix="/users", tags=["users"])
+avatar_images_router = APIRouter(prefix="/api/v1/avatars", tags=["users"])
 
-DEFAULT_AVATAR = "https://images.unsplash.com/photo-1534528741775-53994a69daeb?auto=format&fit=crop&w=250&q=80"
+SOCIAL_PROVIDERS = (("google", "Google"), ("apple", "Apple"))
 
 
-async def _build_full_profile(user_id: int, include_email: bool) -> dict:
+def _restricted_profile(user) -> dict:
+    """The card a viewer gets when the runner's privacy level hides everything else."""
+    return {
+        "id": user["id"],
+        "username": user["username"],
+        "first_name": user["username"],
+        "avatar_url": user["avatar_url"] or "",
+        "city": "",
+        "territory_color": user["territory_color"],
+        "total_territories": 0,
+        "total_km": 0,
+        "total_runs": 0,
+        "stats": {
+            "total_runs": 0,
+            "total_km": 0,
+            "total_duration_hours": 0,
+            "bases_claimed": 0,
+            "bases_held": 0,
+            "avg_pace": format_pace(pace_seconds_per_km(0, 0)),
+        },
+        "is_restricted": True,
+    }
+
+
+async def _build_full_profile(user_id: int, viewer_id: Optional[int]) -> dict:
+    is_self = viewer_id == user_id
     async with connection() as conn:
         user = await conn.fetchrow(USER_PROFILE_SQL + " WHERE u.id = $1 AND u.is_active", user_id)
         if not user:
             raise HTTPException(status_code=404, detail="User not found")
+        if not await privacy.is_visible(conn, user_id, viewer_id):
+            return _restricted_profile(user)
         runs = await conn.fetchrow(
             """
             SELECT count(*) AS total_runs,
@@ -52,10 +84,10 @@ async def _build_full_profile(user_id: int, include_email: bool) -> dict:
     return {
         "id": user["id"],
         "username": user["username"],
-        "email": user["email"] if include_email else None,
+        "email": user["email"] if is_self else None,
         "first_name": user["first_name"],
         "last_name": user["last_name"],
-        "avatar_url": user["avatar_url"] or DEFAULT_AVATAR,
+        "avatar_url": user["avatar_url"] or "",
         "bio": user["bio"],
         "city": user["city"] or "",
         "territory_color": user["territory_color"],
@@ -73,6 +105,24 @@ async def _build_full_profile(user_id: int, include_email: bool) -> dict:
             "bases_held": bases_held,
             "avg_pace": format_pace(pace_seconds_per_km(runs["total_seconds"], runs["total_km"])),
         },
+        "privacy_level": user["privacy_level"] if is_self else None,
+        "auth_provider": user["auth_provider"] if is_self else None,
+    }
+
+
+async def _identity_response(user_id: int, message: str) -> dict:
+    async with connection() as conn:
+        user = await conn.fetchrow(USER_PROFILE_SQL + " WHERE u.id = $1", user_id)
+    return {
+        "user_id": str(user["id"]),
+        "username": user["username"],
+        "territory_color": user["territory_color"],
+        "avatar_url": user["avatar_url"] or "",
+        "bio": user["bio"],
+        "club_id": user["club_id"],
+        "club_name": user["club_name"],
+        "privacy_level": user["privacy_level"],
+        "message": message,
     }
 
 
@@ -81,7 +131,7 @@ async def _update_identity(user: dict, request: UpdateIdentityRequest) -> dict:
     updates = {}
     if request.username is not None and request.username != user["username"]:
         updates["username"] = request.username
-    for column in ("territory_color", "avatar_url", "bio", "first_name", "last_name", "city"):
+    for column in ("territory_color", "avatar_url", "bio", "first_name", "last_name", "city", "privacy_level"):
         value = getattr(request, column)
         if value is not None:
             updates[column] = value.strip() if isinstance(value, str) else value
@@ -93,21 +143,13 @@ async def _update_identity(user: dict, request: UpdateIdentityRequest) -> dict:
                 await conn.execute(f"UPDATE users SET {assignments} WHERE id = $1", user["id"], *updates.values())
             except asyncpg.UniqueViolationError:
                 raise HTTPException(status_code=400, detail="Username is already taken")
+        if "avatar_url" in updates and updates["avatar_url"] != user["avatar_url"]:
+            await conn.execute("DELETE FROM avatars WHERE user_id = $1", user["id"])  # replaced by a plain URL
         # club_id: a value joins that club, an explicit null leaves the current club
         if "club_id" in fields and request.club_id != user["club_id"]:
             await set_user_club(conn, user["id"], request.club_id)
-        updated = await conn.fetchrow(USER_PROFILE_SQL + " WHERE u.id = $1", user["id"])
 
-    return {
-        "user_id": str(updated["id"]),
-        "username": updated["username"],
-        "territory_color": updated["territory_color"],
-        "avatar_url": updated["avatar_url"] or "",
-        "bio": updated["bio"],
-        "club_id": updated["club_id"],
-        "club_name": updated["club_name"],
-        "message": "Identity updated successfully",
-    }
+    return await _identity_response(user["id"], "Identity updated successfully")
 
 
 @router.get("/me", response_model=FullUserProfileResponse)
@@ -115,7 +157,7 @@ async def get_my_profile_me(current_user: dict = Depends(get_current_user)):
     """
     Screen 12: the authenticated runner's profile, lifetime stats and club.
     """
-    return await _build_full_profile(current_user["id"], include_email=True)
+    return await _build_full_profile(current_user["id"], current_user["id"])
 
 
 @router.get("/profile", response_model=FullUserProfileResponse)
@@ -123,7 +165,100 @@ async def get_my_full_profile(current_user: dict = Depends(get_current_user)):
     """
     Screen 12: alias of /users/me.
     """
-    return await _build_full_profile(current_user["id"], include_email=True)
+    return await _build_full_profile(current_user["id"], current_user["id"])
+
+
+@router.post(
+    "/me/avatar",
+    response_model=IdentityResponse,
+    openapi_extra={
+        "requestBody": {
+            "required": True,
+            "content": {"multipart/form-data": {"schema": {
+                "type": "object",
+                "required": ["file"],
+                "properties": {"file": {"type": "string", "format": "binary"}},
+            }}},
+        },
+    },
+)
+async def upload_avatar(request: Request, current_user: dict = Depends(get_current_user)):
+    """
+    Edit Profile: upload or replace the profile photo (JPEG, PNG or WebP, 5 MB max).
+    The body is read here rather than declared as a parameter so that it is
+    only accepted after authentication, and is cut off at the size limit.
+    """
+    await avatar_service.upload_avatar(request, current_user["id"])
+    return await _identity_response(current_user["id"], "Profile photo updated")
+
+
+@router.delete("/me/avatar", response_model=IdentityResponse)
+async def remove_avatar(current_user: dict = Depends(get_current_user)):
+    """
+    Edit Profile: remove the profile photo. The app falls back to initials.
+    """
+    await avatar_service.remove_avatar(current_user["id"])
+    return await _identity_response(current_user["id"], "Profile photo removed")
+
+
+@avatar_images_router.get("/{key}.jpg")
+async def get_avatar_image(key: str):
+    """
+    Public image bytes behind avatar_url. Keys are random and change on every upload.
+    """
+    data = await avatar_service.get_avatar_image(key)
+    if data is None:
+        raise HTTPException(status_code=404, detail="Photo not found")
+    return Response(
+        content=data,
+        media_type="image/jpeg",
+        headers={"Cache-Control": avatar_service.CACHE_CONTROL, "X-Content-Type-Options": "nosniff"},
+    )
+
+
+@router.get("/me/connected-apps", response_model=ConnectedAppsResponse)
+async def get_connected_apps(current_user: dict = Depends(get_current_user)):
+    """
+    Edit Profile: the social sign-ins connected to this account.
+    """
+    async with connection() as conn:
+        rows = await conn.fetch(
+            "SELECT provider, connected_at FROM connected_accounts WHERE user_id = $1", current_user["id"]
+        )
+    connected_at = {r["provider"]: r["connected_at"] for r in rows}
+    primary = current_user["auth_provider"]
+    return {
+        "apps": [
+            {
+                "provider": provider,
+                "name": name,
+                # Accounts created before connected_accounts existed have no row
+                "connected": provider in connected_at or provider == primary,
+                "connected_at": iso(connected_at.get(provider)),
+                "is_primary": provider == primary,
+            }
+            for provider, name in SOCIAL_PROVIDERS
+        ]
+    }
+
+
+@router.post("/me/delete", response_model=AccountActionResponse)
+async def delete_my_account(request: DeleteAccountRequest, current_user: dict = Depends(get_current_user)):
+    """
+    Edit Profile: permanently delete the account and everything recorded for it.
+    A POST because the app's DELETE helper sends no body, and this needs the
+    password. Failures are 400, not 401: the app logs the runner out on a 401.
+    """
+    if current_user["auth_provider"] == "password":
+        async with connection() as conn:
+            hashed = await conn.fetchval("SELECT hashed_password FROM users WHERE id = $1", current_user["id"])
+        if not request.password or not await verify_password(request.password, hashed):
+            raise HTTPException(status_code=400, detail="Password is incorrect")
+    elif request.confirmation != "DELETE":
+        raise HTTPException(status_code=400, detail='Send confirmation "DELETE" to delete this account')
+
+    await account_service.delete_account(current_user["id"])
+    return {"status": "success", "message": "Account deleted"}
 
 
 @router.put("/identity", response_model=IdentityResponse)
@@ -158,9 +293,10 @@ async def get_user_profile_by_id(
     current_user: Optional[dict] = Depends(get_current_user_optional),
 ):
     """
-    Screen 12: public runner profile (email only shown to its owner).
+    Screen 12: public runner profile (email only shown to its owner). A runner
+    hidden by their privacy level comes back as a minimal `is_restricted` card.
     """
-    return await _build_full_profile(user_id, include_email=bool(current_user and current_user["id"] == user_id))
+    return await _build_full_profile(user_id, current_user["id"] if current_user else None)
 
 
 @router.get("/{user_id}/runs", response_model=RunHistoryResponse)
@@ -210,11 +346,12 @@ async def get_user_runs(
 
 
 @router.get("/{user_id}/territories", response_model=BaseListResponse)
-async def get_user_territories(user_id: int):
+async def get_user_territories(user_id: int, current_user: Optional[dict] = Depends(get_current_user_optional)):
     """
-    Screen 12: territories currently held by a runner.
+    Screen 12: territories currently held by a runner (403 when their privacy level hides them).
     """
     async with connection() as conn:
+        await privacy.require_visible(conn, user_id, current_user["id"] if current_user else None)
         rows = await conn.fetch(
             TERRITORY_SELECT + " WHERE t.owner_id = $1 AND t.status = 'active' ORDER BY t.id DESC", user_id
         )
@@ -224,12 +361,13 @@ async def get_user_territories(user_id: int):
 @router.get("/{user_id}/achievements", response_model=AchievementsResponse)
 async def get_user_achievements(user_id: int, current_user: dict = Depends(get_current_user)):
     """
-    Screen 12: unlocked badges of a runner.
+    Screen 12: unlocked badges of a runner (403 when their privacy level hides them).
     """
     async with connection() as conn:
         exists = await conn.fetchval("SELECT EXISTS (SELECT 1 FROM users WHERE id = $1)", user_id)
         if not exists:
             raise HTTPException(status_code=404, detail="User not found")
+        await privacy.require_visible(conn, user_id, current_user["id"])
         rows = await conn.fetch(
             """
             SELECT a.id, a.key, a.title, a.description, a.badge_icon, ua.unlocked_at

@@ -203,3 +203,42 @@ CREATE TABLE IF NOT EXISTS friendships (
     PRIMARY KEY (user_id, friend_id),
     CHECK (user_id <> friend_id)
 );
+
+-- 12. Who may see a runner's details: public | friends | private (services/privacy.py).
+-- Checked first because this file runs on every cold start and ALTER TABLE takes
+-- an exclusive lock on users even when IF NOT EXISTS turns it into a no-op.
+DO $$
+BEGIN
+    IF NOT EXISTS (
+        SELECT 1 FROM information_schema.columns
+        WHERE table_schema = 'public' AND table_name = 'users' AND column_name = 'privacy_level'
+    ) THEN
+        ALTER TABLE users ADD COLUMN privacy_level VARCHAR(10) NOT NULL DEFAULT 'public'
+            CHECK (privacy_level IN ('public', 'friends', 'private'));
+    END IF;
+END $$;
+
+-- 13. Profile photos: one per runner. A new key on every upload keeps CDN caches honest.
+CREATE TABLE IF NOT EXISTS avatars (
+    user_id INTEGER PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
+    key VARCHAR(32) NOT NULL UNIQUE,
+    data BYTEA NOT NULL,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+-- 14. Upload log for the hourly limit (survives photo removal, unlike avatars)
+CREATE TABLE IF NOT EXISTS avatar_uploads (
+    id BIGSERIAL PRIMARY KEY,
+    user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+CREATE INDEX IF NOT EXISTS idx_avatar_uploads_user ON avatar_uploads (user_id, created_at);
+
+-- 15. Social sign-ins used on an account (an account created with a password can
+-- also sign in with Google, so users.auth_provider alone is not the whole story)
+CREATE TABLE IF NOT EXISTS connected_accounts (
+    user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    provider VARCHAR(20) NOT NULL,
+    connected_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    PRIMARY KEY (user_id, provider)
+);

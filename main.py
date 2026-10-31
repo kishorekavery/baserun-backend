@@ -35,6 +35,8 @@ ERROR_CODES = {
     404: "NOT_FOUND",
     405: "METHOD_NOT_ALLOWED",
     409: "CONFLICT",
+    413: "PAYLOAD_TOO_LARGE",
+    415: "UNSUPPORTED_MEDIA_TYPE",
     422: "VALIDATION_ERROR",
     429: "TOO_MANY_REQUESTS",
     503: "SERVICE_UNAVAILABLE",
@@ -118,6 +120,7 @@ app.include_router(friends_router.router)
 # Mount feature routers at root level for Flutter ApiConfig compatibility
 app.include_router(auth_ext.router)
 app.include_router(users_router.router)
+app.include_router(users_router.avatar_images_router)
 app.include_router(app_info.router)
 app.include_router(runs_router.router)
 app.include_router(territories_router.router)

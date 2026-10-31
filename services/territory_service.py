@@ -27,10 +27,13 @@ CLUB_HERO_BASES = 5
 LEGACY_MIN_AREA_M2 = 100
 LEGACY_MAX_AREA_M2 = 500_000
 DEFAULT_COLOR = "#00E5FF"
+DEFAULT_NAME_SUFFIX = "'s Base"
+UNCLAIMED_NAME = "Unclaimed Base"
 
 TERRITORY_SELECT = """
     SELECT t.*,
            u.username AS owner_username, u.avatar_url AS owner_avatar, u.territory_color AS owner_color,
+           u.privacy_level AS owner_privacy,
            c.name AS club_name, c.color AS club_color
     FROM territories t
     LEFT JOIN users u ON u.id = t.owner_id
@@ -92,12 +95,13 @@ async def insert_territory(
 
 
 async def _best_overlap(conn: asyncpg.Connection, metrics: PolygonMetrics):
-    """Active territory that is essentially the same loop (> 75% mutual overlap), row-locked."""
+    """Territory that is essentially the same loop (> 75% mutual overlap), row-locked."""
     min_lng, min_lat, max_lng, max_lat = metrics.polygon.bounds
     candidates = await conn.fetch(
         """
         SELECT * FROM territories
-        WHERE status = 'active' AND max_lat >= $1 AND min_lat <= $2 AND max_lng >= $3 AND min_lng <= $4
+        WHERE status IN ('active', 'unclaimed')
+          AND max_lat >= $1 AND min_lat <= $2 AND max_lng >= $3 AND min_lng <= $4
         ORDER BY id
         FOR UPDATE
         """,
@@ -162,7 +166,7 @@ async def claim_from_run(user: dict, request: ClaimFromRunRequest) -> dict:
 
         pace = run["avg_pace_seconds"] or None
         distance_km = run["distance_km"] or 0.0
-        name = (request.territory_name or "").strip() or f"{user['username']}'s Base"
+        name = (request.territory_name or "").strip() or f"{user['username']}{DEFAULT_NAME_SUFFIX}"
         existing = await _best_overlap(conn, metrics)
         keys: List[str] = []
 
@@ -191,7 +195,11 @@ async def claim_from_run(user: dict, request: ClaimFromRunRequest) -> dict:
         else:
             territory_id = existing["id"]
             incumbent = existing["record_pace_seconds"]
-            faster = pace is not None and (incumbent is None or pace < incumbent)
+            ownerless = existing["owner_id"] is None
+            faster = ownerless or (pace is not None and (incumbent is None or pace < incumbent))
+            # Default names carry the holder's username, which may be private
+            default_name = existing["name"].endswith(DEFAULT_NAME_SUFFIX) or existing["name"] == UNCLAIMED_NAME
+            label = "this base" if default_name else existing["name"]
             if faster:
                 outcome = "takeover"
                 await conn.execute(
@@ -204,10 +212,11 @@ async def claim_from_run(user: dict, request: ClaimFromRunRequest) -> dict:
                     WHERE id = $1
                     """,
                     territory_id, user["id"], user["club_id"], run["id"], pace, now, distance_km,
-                    (request.territory_name or "").strip() or existing["name"],
+                    (request.territory_name or "").strip() or (name if default_name else existing["name"]),
                 )
-                keys.append("hostile_takeover")
-                message = f"You captured {existing['name']}!"
+                if not ownerless:
+                    keys.append("hostile_takeover")
+                message = f"You captured {label}!"
             else:
                 outcome = "challenge_failed"
                 await conn.execute(
@@ -220,7 +229,7 @@ async def claim_from_run(user: dict, request: ClaimFromRunRequest) -> dict:
                     territory_id, now,
                 )
                 message = (
-                    f"Too slow! {existing['name']} is defended by a {format_pace(incumbent)} /km record pace."
+                    f"Too slow! {label} is defended by a {format_pace(incumbent)} /km record pace."
                 )
             await _resolve_challenges(conn, territory_id, user["id"], won=faster)
 
@@ -279,7 +288,7 @@ async def claim_raw_polygon(user: dict, points: Sequence[LocationPoint]) -> dict
 
     async with transaction() as conn:
         base_id = await insert_territory(
-            conn, name=f"{user['username']}'s Base", owner_id=user["id"], club_id=user["club_id"],
+            conn, name=f"{user['username']}{DEFAULT_NAME_SUFFIX}", owner_id=user["id"], club_id=user["club_id"],
             run_id=None, metrics=metrics, record_pace_seconds=None, total_km=metrics.perimeter_km,
         )
     return {

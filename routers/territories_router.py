@@ -13,7 +13,7 @@ from models.datamodel import (
     TerritoryDetailResponse,
 )
 from routers.core import get_current_user, get_current_user_optional
-from services import territory_service
+from services import privacy, territory_service
 from services.run_service import ACTIVE_RUNNER_WINDOW
 from services.territory_service import DEFAULT_COLOR, TERRITORY_SELECT, effective_defense_level
 from utils.geo import bbox_for_radius, distance_to_polygon_m, load_polygon, simplify_for_client
@@ -30,6 +30,7 @@ async def get_nearby_territories(
     lng: float = Query(80.2707, ge=-180, le=180),
     radius_km: float = Query(5.0, gt=0, le=50.0),
     limit: int = Query(50, ge=1, le=200),
+    current_user: Optional[dict] = Depends(get_current_user_optional),
 ):
     """
     Screens 5/6: active territories within `radius_km` of a point, nearest
@@ -45,6 +46,7 @@ async def get_nearby_territories(
             """,
             min_lat, max_lat, min_lng, max_lng, MAX_MAP_TERRITORIES,
         )
+        rows = await privacy.mask_territories(conn, rows, current_user["id"] if current_user else None)
 
     items = []
     for r in rows:
@@ -106,6 +108,9 @@ async def get_home_map(
 
     async with connection() as conn:
         viewer_id = current_user["id"] if current_user else user_id
+        # The legacy parameter is unverified: it must not reveal a hidden runner's tallies
+        if current_user is None and user_id is not None and not await privacy.is_visible(conn, user_id, None):
+            viewer_id = None
         viewer_club_id = None
         if current_user:
             viewer_club_id = current_user["club_id"]
@@ -118,6 +123,7 @@ async def get_home_map(
                    COALESCE(t.owner_id = $6::int, FALSE) AS is_user_territory,
                    COALESCE(t.club_id = $7::int, FALSE) AS is_club_territory,
                    u.username AS owner_username, u.territory_color AS owner_color,
+                   u.privacy_level AS owner_privacy,
                    c.name AS club_name, c.color AS club_color
             FROM territories t
             LEFT JOIN users u ON u.id = t.owner_id
@@ -128,6 +134,7 @@ async def get_home_map(
             """,
             b_min_lat, b_max_lat, b_min_lng, b_max_lng, MAX_MAP_TERRITORIES, viewer_id, viewer_club_id,
         )
+        rows = await privacy.mask_territories(conn, rows, current_user["id"] if current_user else None)
         counters = await conn.fetchrow(
             """
             SELECT
@@ -159,7 +166,7 @@ async def get_home_map(
             "area_km2": r["area_km2"],
             "defense_level": effective_defense_level(r),
             "polygon_wkt": simplify_for_client(r["polygon_wkt"], r["area_km2"]),
-            "is_user_territory": r["is_user_territory"],
+            "is_user_territory": r["is_user_territory"] and r["owner_id"] is not None,
             "is_club_territory": r["is_club_territory"],
         })
 
@@ -197,8 +204,9 @@ async def get_territory_details(
     """
     async with connection() as conn:
         row = await conn.fetchrow(TERRITORY_SELECT + " WHERE t.id = $1", territory_id)
-    if not row:
-        raise HTTPException(status_code=404, detail="Territory not found")
+        if not row:
+            raise HTTPException(status_code=404, detail="Territory not found")
+        row = (await privacy.mask_territories(conn, [row], current_user["id"] if current_user else None))[0]
 
     now = utcnow()
     viewer_id = current_user["id"] if current_user else current_user_id
@@ -250,6 +258,7 @@ async def challenge_territory(
                 raise HTTPException(status_code=404, detail="Territory not found")
             if row["owner_id"] == current_user["id"]:
                 raise HTTPException(status_code=400, detail="You cannot challenge your own territory")
+            row = (await privacy.mask_territories(conn, [row], current_user["id"]))[0]
 
             challenge = await conn.fetchrow(
                 """
@@ -271,9 +280,10 @@ async def challenge_territory(
     target_pace = format_pace(row["record_pace_seconds"])
     owner = row["owner_username"] or "nobody"
     if row["record_pace_seconds"]:
+        rival = f"@{owner}" if row["owner_id"] is not None else "its holder"
         instructions = (
             f"Run the {row['perimeter_km']:.2f} km perimeter of {row['name']} faster than {target_pace} /km "
-            f"to claim this base from @{owner}!"
+            f"to claim this base from {rival}!"
         )
     else:
         instructions = f"Run the {row['perimeter_km']:.2f} km perimeter of {row['name']} to claim this base!"

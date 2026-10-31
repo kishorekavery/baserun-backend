@@ -6,8 +6,10 @@ import secrets
 import asyncpg
 from fastapi import APIRouter, Depends, HTTPException, Query
 
-from db.database import connection
+from db.database import connection, transaction
 from models.datamodel import (
+    AccountActionResponse,
+    ChangePasswordRequest,
     CheckUsernameResponse,
     LoginRequest,
     LoginResponse,
@@ -18,7 +20,7 @@ from models.datamodel import (
     SocialLoginRequest,
 )
 from routers import core
-from routers.core import build_auth_response, get_current_user, hash_password
+from routers.core import build_auth_response, get_current_user, hash_password, verify_password
 from utils.helper import is_valid_username
 from utils.social_auth import SocialAuthError, allow_unverified, verify_social_token
 
@@ -52,6 +54,34 @@ async def auth_logout(current_user: dict = Depends(get_current_user)):
     Invalidates current session on the server.
     """
     return await core.logout(current_user)
+
+
+@router.post("/change-password", response_model=AccountActionResponse)
+async def change_password(request: ChangePasswordRequest, current_user: dict = Depends(get_current_user)):
+    """
+    Edit Profile: change the password and sign out every other device.
+    Wrong passwords are 400, not 401: the app logs the runner out on a 401.
+    """
+    if current_user["auth_provider"] != "password":
+        raise HTTPException(
+            status_code=400,
+            detail=f"This account signs in with {current_user['auth_provider'].title()} and has no password",
+        )
+    async with connection() as conn:
+        hashed = await conn.fetchval("SELECT hashed_password FROM users WHERE id = $1", current_user["id"])
+    if not await verify_password(request.current_password, hashed):
+        raise HTTPException(status_code=400, detail="Current password is incorrect")
+    if request.new_password == request.current_password:
+        raise HTTPException(status_code=400, detail="New password must be different from the current one")
+
+    new_hash = await hash_password(request.new_password)
+    async with transaction() as conn:
+        await conn.execute("UPDATE users SET hashed_password = $2 WHERE id = $1", current_user["id"], new_hash)
+        await conn.execute(
+            "UPDATE sessions SET is_revoked = TRUE WHERE user_id = $1 AND session_id <> $2",
+            current_user["id"], current_user["current_session_id"],
+        )
+    return {"status": "success", "message": "Password changed"}
 
 
 @router.get("/check-username", response_model=CheckUsernameResponse)
@@ -128,4 +158,8 @@ async def social_login(request: SocialLoginRequest):
                         break
             if user_id is None:
                 raise HTTPException(status_code=409, detail="Could not allocate a unique username, please retry")
+        await conn.execute(
+            "INSERT INTO connected_accounts (user_id, provider) VALUES ($1, $2) ON CONFLICT DO NOTHING",
+            user_id, request.provider,
+        )
         return await build_auth_response(conn, user_id, Message.LOGIN_SUCCESSFUL, is_new_user=is_new)

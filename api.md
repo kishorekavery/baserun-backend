@@ -28,10 +28,13 @@ Every error returns a `detail` and a machine-readable `code`:
 | :--- | :--- | :--- |
 | 400 | `BAD_REQUEST` | Duplicate account, run already claimed, loop not closed |
 | 401 | `UNAUTHORIZED` | Missing/invalid/expired/revoked token, wrong credentials |
-| 403 | `FORBIDDEN` | Acting on another runner's run or account |
+| 403 | `FORBIDDEN` | Acting on another runner's run or account; a runner's privacy level hides this data |
 | 404 | `NOT_FOUND` | Unknown run, territory, club or user |
 | 409 | `CONFLICT` | Run already completed, duplicate `activity_id` on start |
+| 413 | `PAYLOAD_TOO_LARGE` | Profile photo over the size limit |
+| 415 | `UNSUPPORTED_MEDIA_TYPE` | Profile photo is not a JPEG, PNG or WebP |
 | 422 | `VALIDATION_ERROR` | Invalid body/query (`detail` is the standard FastAPI error list) |
+| 429 | `TOO_MANY_REQUESTS` | Upload or friend-request limit reached |
 | 503 | `SERVICE_UNAVAILABLE` | Database unreachable — safe to retry |
 
 Validation error example:
@@ -245,6 +248,17 @@ Sessions are stored server-side. A token stays valid for `expires_in` seconds (d
   "message": "Successfully logged out"
 }
 ```
+
+### `POST /auth/change-password` — Change Password
+* **Auth Required:** `Bearer <TOKEN>`
+* **Request Body:** `{ "current_password": "...", "new_password": "..." }` (`new_password`: 6-128 characters, as at registration).
+* **Effect:** every other device is signed out; the current session stays valid.
+* **Response `(200 OK)`:** `{ "status": "success", "message": "Password changed" }`
+* **Errors:**
+  * `400 "Current password is incorrect"` (a 400 on purpose: the app logs the runner out on a 401)
+  * `400` new password equals the current one
+  * `400` the account signs in with Google or Apple and has no password. Check `auth_provider` from `/users/me` to hide the option.
+  * `422` new password too short or too long
 
 ### `GET /api/v1/bases/me` — Minimal Session Check
 * **Auth Required:** `Bearer <TOKEN>`
@@ -726,7 +740,8 @@ These are kept for older app builds:
 
 ### `GET /users/{user_id}/profile` — Public Runner Profile
 * **Auth Required:** Optional
-* **Response `(200 OK)`:** same shape as `/users/me`; `email` is `null` unless you are viewing your own profile.
+* **Response `(200 OK)`:** same shape as `/users/me`; `email`, `privacy_level` and `auth_provider` are `null` unless you are viewing your own profile.
+* A runner hidden by their [privacy level](#privacy-levels) comes back as a minimal card with `is_restricted: true`: `username`, `avatar_url` and `territory_color` are real, `first_name` is the username, and everything else is empty or zero. Show "This profile is private" rather than the zeros.
 
 ### `PUT /users/identity` (or `PUT /users/{user_id}` for your own id) — Update Identity
 * **Auth Required:** `Bearer <TOKEN>`
@@ -745,7 +760,7 @@ These are kept for older app builds:
   "club_id": 1
 }
 ```
-Other accepted fields: `username`, `first_name`, `last_name`, `city`.
+Other accepted fields: `username`, `first_name`, `last_name`, `city`, `privacy_level` (`public`, `friends` or `private`).
 * **Response `(200 OK)`:**
 ```json
 {
@@ -756,6 +771,7 @@ Other accepted fields: `username`, `first_name`, `last_name`, `city`.
   "bio": "Conquering Marina Beach one mile at a time.",
   "club_id": 1,
   "club_name": "Marina Striders",
+  "privacy_level": "public",
   "message": "Identity updated successfully"
 }
 ```
@@ -763,7 +779,62 @@ Other accepted fields: `username`, `first_name`, `last_name`, `city`.
   * `400 "Username is already taken"`
   * `403` (`PUT /users/{user_id}` with another runner's id)
   * `404 "Club not found"`
-  * `422` (invalid color or username)
+  * `422` (invalid color, username or privacy level)
+
+### `POST /users/me/avatar` — Upload or Replace Profile Photo
+* **Auth Required:** `Bearer <TOKEN>`
+* **Request Body:** `multipart/form-data` with one file field, `file`. JPEG, PNG or WebP, detected from the file's contents. HEIC is not accepted.
+* **Processing:** rotated upright, center-cropped, flattened onto white, resized to 512 × 512 and re-encoded as JPEG, which drops all metadata including GPS.
+* **Response `(200 OK)`:** the `PUT /users/identity` shape with `"message": "Profile photo updated"`. `avatar_url` is a new URL on every upload, and the previous URL stops working.
+* **Errors:**
+  * `400` missing `file` field, unreadable image, or dimensions over 25 megapixels
+  * `413` over 5 MB. On Vercel, requests over about 4.5 MB are refused by the platform first, with a non-JSON `413`. The app's 512 px uploads are far below both limits.
+  * `415` not a JPEG, PNG or WebP
+  * `429` more than 10 uploads per hour
+
+### `DELETE /users/me/avatar` — Remove Profile Photo
+* **Auth Required:** `Bearer <TOKEN>`
+* **Response `(200 OK)`:** the `PUT /users/identity` shape with an empty `avatar_url` and `"message": "Profile photo removed"`.
+* Runners without a photo have an empty `avatar_url` everywhere it appears, so show their initials.
+
+### `GET /api/v1/avatars/{key}.jpg` — Profile Photo Image
+* **Auth Required:** No. This is the URL in `avatar_url`.
+* **Response `(200 OK)`:** `image/jpeg`, cacheable forever by clients because keys never change. `404` once the photo is replaced or removed.
+
+### `GET /users/me/connected-apps` — Connected Sign-ins
+* **Auth Required:** `Bearer <TOKEN>`
+* **Response `(200 OK)`:** one entry per supported provider. Read-only: signing in with a provider connects it, and there is no disconnect, because social login matches accounts by verified email and would reconnect it.
+```json
+{
+  "apps": [
+    { "provider": "google", "name": "Google", "connected": true, "connected_at": "2026-10-24T01:35:10Z", "is_primary": true },
+    { "provider": "apple", "name": "Apple", "connected": false, "connected_at": null, "is_primary": false }
+  ]
+}
+```
+`is_primary` means the account was created with that provider. `connected_at` can be `null` for accounts older than this feature.
+
+### `POST /users/me/delete` — Delete Account
+* **Auth Required:** `Bearer <TOKEN>`
+* **Request Body:** password accounts send `{ "password": "..." }`. Google and Apple accounts have no password and send `{ "confirmation": "DELETE" }`. Use `auth_provider` from `/users/me` to pick.
+* **Effect:** permanent, immediate and not recoverable. Removes the account, sessions, runs, GPS history, friendships, badges and photo, and frees the username and email. The runner's bases become `unclaimed`: they stay on the map with no owner and no record pace, and the next runner to complete a matching loop wins them. Default names like `sam's Base` become `Unclaimed Base`.
+* **Response `(200 OK)`:** `{ "status": "success", "message": "Account deleted" }`. The token stops working, so clear it and return to sign-in.
+* **Errors:** `400` wrong password or missing confirmation (a 400 on purpose: the app logs the runner out on a 401).
+
+### Privacy Levels
+Set with `PUT /users/identity`; read from `/users/me`. `friends` shows details to the runner and their friends, `private` to the runner only, and `public` (the default) to everyone.
+
+Viewers who can't see a runner get:
+| Surface | What changes |
+| :--- | :--- |
+| `/users/{id}/profile` | The minimal `is_restricted` card |
+| `/users/{id}/territories`, `/users/{id}/achievements`, `/api/v1/bases/user/{id}/stats`, `/api/v1/bases?user_id={id}` | `403 "This runner's profile is private"` |
+| Map, territory and base responses | The base stays visible, with `owner_id` null, `owner_username` `"Private runner"`, no avatar and the default color. A default base name becomes `Private Base`; custom names are kept. |
+| Club leaderboard | Rank and totals stay; name and avatar are replaced, and `user_id` is empty |
+| `/api/v1/users/search` | `friends`: found by username only, without name, club or stats. `private`: not found, except by existing friends. |
+| Friends lists and requests | Name, club and stats are `null`; username, avatar and color remain |
+
+A `private` runner can still be sent a friend request by exact username. Only a verified Bearer token counts as the viewer: the legacy `user_id` and `current_user_id` query parameters never unlock anything.
 
 ### `GET /users/{user_id}/runs?limit=20&offset=0` — User Run History
 * **Auth Required:** `Bearer <TOKEN>` (restricted to the account owner, otherwise `403`)
@@ -1047,3 +1118,5 @@ All friends routes require `Bearer <TOKEN>`; the caller always comes from the to
 | Claim `area_km2` / `perimeter_km` in body | Used when the server got 0 | Always ignored |
 | `/users/{id}/profile` | Exposed email | Email only for the profile owner |
 | Errors | `{"detail": ...}` | `{"detail": ..., "code": ...}` |
+| `avatar_url` with no photo | `/users/me` and profiles returned a stock photo | Empty string, so the app shows initials |
+| Hidden runners | Not applicable | See [Privacy Levels](#privacy-levels): `owner_id` can be `null` on an active base, and some runner routes can return `403` |

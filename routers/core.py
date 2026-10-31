@@ -28,7 +28,7 @@ from models.datamodel import (
     UserProfile,
     UserStatsResponse,
 )
-from services import run_service, territory_service
+from services import privacy, run_service, territory_service
 from services.ownership import get_activity_with_ownership, verify_ownership  # noqa: F401 (re-exported)
 from services.territory_service import TERRITORY_SELECT, base_item
 from utils.helper import iso, utcnow
@@ -339,11 +339,15 @@ async def get_bases(
     user_id: int | None = Query(None, description="Filter bases by user ID (optional)"),
     limit: int = Query(50, ge=1, le=200, description="Page limit"),
     offset: int = Query(0, ge=0, description="Page offset"),
+    current_user: dict | None = Depends(get_current_user_optional),
 ):
     """
     Get claimed bases for map rendering, optionally filtered by owner.
     """
+    viewer_id = current_user["id"] if current_user else None
     async with connection() as conn:
+        if user_id is not None:
+            await privacy.require_visible(conn, user_id, viewer_id)
         rows = await conn.fetch(
             TERRITORY_SELECT + """
             WHERE t.status = 'active' AND ($1::int IS NULL OR t.owner_id = $1)
@@ -355,15 +359,17 @@ async def get_bases(
             "SELECT count(*) FROM territories WHERE status = 'active' AND ($1::int IS NULL OR owner_id = $1)",
             user_id,
         )
+        rows = await privacy.mask_territories(conn, rows, viewer_id)
     return {"total": total, "bases": [base_item(r) for r in rows]}
 
 
 @router.get("/user/{user_id}/stats", response_model=UserStatsResponse)
-async def get_user_stats(user_id: int):
+async def get_user_stats(user_id: int, current_user: dict | None = Depends(get_current_user_optional)):
     """
     Aggregated territory stats for a user (total bases, total area, total perimeter).
     """
     async with connection() as conn:
+        await privacy.require_visible(conn, user_id, current_user["id"] if current_user else None)
         row = await conn.fetchrow(
             """
             SELECT count(*) AS total_bases,
@@ -407,12 +413,13 @@ async def get_activity_telemetry(activity_id: str, current_user: dict = Depends(
 
 
 @router.get("/{base_id}", response_model=BaseItem)
-async def get_base_by_id(base_id: int):
+async def get_base_by_id(base_id: int, current_user: dict | None = Depends(get_current_user_optional)):
     """
     Get detailed information about a single claimed base by its ID.
     """
     async with connection() as conn:
         row = await conn.fetchrow(TERRITORY_SELECT + " WHERE t.id = $1", base_id)
-    if not row:
-        raise HTTPException(status_code=404, detail="Base not found")
-    return base_item(row)
+        if not row:
+            raise HTTPException(status_code=404, detail="Base not found")
+        masked = await privacy.mask_territories(conn, [row], current_user["id"] if current_user else None)
+    return base_item(masked[0])
