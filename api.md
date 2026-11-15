@@ -1,6 +1,8 @@
 # BaseRun Backend API Usage & Integration Guide
 
-All endpoints communicate using JSON (`Content-Type: application/json`). Protected routes require a valid JWT passed via `Authorization: Bearer <TOKEN>`.
+All endpoints communicate using JSON (`Content-Type: application/json`), except photo upload (`multipart/form-data`) and photo images (`image/jpeg`). Protected routes require a valid JWT passed via `Authorization: Bearer <TOKEN>`.
+
+**App developers:** start with [section 9, Frontend Change List](#9-frontend-change-list), which lists what the app must change for the account and profile update.
 
 ### Base URLs
 * **Local Development:** `http://localhost:8000` (or `http://10.0.2.2:8000` for Android Emulator)
@@ -26,13 +28,13 @@ Every error returns a `detail` and a machine-readable `code`:
 ```
 | HTTP | `code` | Typical cause |
 | :--- | :--- | :--- |
-| 400 | `BAD_REQUEST` | Duplicate account, run already claimed, loop not closed |
-| 401 | `UNAUTHORIZED` | Missing/invalid/expired/revoked token, wrong credentials |
-| 403 | `FORBIDDEN` | Acting on another runner's run or account; a runner's privacy level hides this data; premium color without premium |
+| 400 | `BAD_REQUEST` | Duplicate account, run already claimed, loop not closed, wrong password on an account action |
+| 401 | `UNAUTHORIZED` | Missing/invalid/expired/revoked token, wrong credentials at login |
+| 403 | `FORBIDDEN` | Acting on another runner's run or account; a runner's privacy level hides this data; premium color without premium; signing in with a disconnected provider |
 | 404 | `NOT_FOUND` | Unknown run, territory, club or user |
 | 409 | `CONFLICT` | Run already completed, duplicate `activity_id` on start |
 | 413 | `PAYLOAD_TOO_LARGE` | Profile photo over the size limit |
-| 415 | `UNSUPPORTED_MEDIA_TYPE` | Profile photo is not a JPEG, PNG or WebP |
+| 415 | `UNSUPPORTED_MEDIA_TYPE` | Profile photo is not a JPEG, PNG, WebP or HEIC |
 | 422 | `VALIDATION_ERROR` | Invalid body/query (`detail` is the standard FastAPI error list) |
 | 429 | `TOO_MANY_REQUESTS` | Upload or friend-request limit reached |
 | 503 | `SERVICE_UNAVAILABLE` | Database unreachable — safe to retry |
@@ -218,6 +220,7 @@ Sessions are stored server-side. A token stays valid for `expires_in` seconds (d
   "is_new_user": null
 }
 ```
+* `avatar_url` is `null` here when the runner has no photo. Sign-in responses don't include `avatar_thumb_url`, `privacy_level`, `auth_provider` or `is_premium`; read those from `/users/me`.
 * **Errors:** `401 "invalid username or password"` — returned for both an unknown account and a wrong password.
 
 ### `POST /auth/social-login` — Google / Apple SSO
@@ -236,7 +239,10 @@ Sessions are stored server-side. A token stays valid for `expires_in` seconds (d
 }
 ```
 * **Response `(200 OK)`:** same shape as `/auth/login`, with `"is_new_user": true | false`.
-* **Errors:** `400 "Unsupported social provider"`, `401 "Invalid Google token"` / `"Invalid Apple token"` / `"Google account email is not verified"`.
+* **Errors:**
+  * `400 "Unsupported social provider"`
+  * `401 "Invalid Google token"` / `"Invalid Apple token"` / `"Google account email is not verified"`
+  * `403 "Google was disconnected from this account. Sign in with your password."` (or `Apple`). Show the `detail` and offer password sign-in.
 
 ### `POST /auth/logout` (Alias: `POST /api/v1/bases/logout`) — Invalidate Session
 * **Auth Required:** `Bearer <TOKEN>`
@@ -294,6 +300,8 @@ Sessions are stored server-side. A token stays valid for `expires_in` seconds (d
   * `user_territories_count` / `club_territories_count` are the caller's totals.
   * `active_runners_nearby` counts runners who sent telemetry inside the view in the last 10 minutes.
   * Returns at most 1000 territories.
+  * `status` is `active` or `unclaimed`. An unclaimed base has `owner_id: null`, an empty `owner_username`, no club and the default `owner_color`, so draw it from `status`, not the color. `unclaimed_territories_count` counts them in the view.
+  * `owner_id` can also be `null` on an `active` base when the owner is hidden. See [Privacy Levels](#privacy-levels).
 * **Example:** `GET /api/v1/map/home?min_lat=13.0&min_lng=80.2&max_lat=13.1&max_lng=80.3`
 * **Response `(200 OK)`:**
 ```json
@@ -324,10 +332,10 @@ Sessions are stored server-side. A token stays valid for `expires_in` seconds (d
 ```
 
 ### `GET /api/v1/territories/nearby?lat={lat}&lng={lng}&radius_km={r}` — Nearby Zones
-* **Auth Required:** No
+* **Auth Required:** Optional (a token reveals owners you are allowed to see)
 * **Screen / Caller:** `LocationPermissionScreen`, `HomeMapScreen`
 * **Query Parameters:** `lat`, `lng`, `radius_km` (default `5.0`, max `50`), `limit` (default `50`, max `200`).
-* **Notes:** Only active territories within `radius_km` are returned, nearest first. Distance is measured to the territory's edge; it is `0` when the point is inside the territory.
+* **Notes:** Only active territories within `radius_km` are returned, nearest first, so unclaimed bases are not included. Distance is measured to the territory's edge; it is `0` when the point is inside the territory.
 * **Response `(200 OK)`:**
 ```json
 {
@@ -387,6 +395,8 @@ Sessions are stored server-side. A token stays valid for `expires_in` seconds (d
 }
 ```
 * **UI hint:** if `is_owner`, show "Fortify Base"; if `can_challenge`, show "Challenge Base". Anonymous viewers get `can_challenge: false`.
+* **Unclaimed base** (`status: "unclaimed"`): `owner_id` and `record_pace_seconds` are `null`, `owner_username` and `owner_avatar` are empty, and `record_pace` is `0'00"`, so hide the record row. `can_challenge` is still `true` for signed-in runners; show "Claim Base", because any pace wins it.
+* **Hidden owner:** see [Privacy Levels](#privacy-levels). The record pace stays visible.
 
 ### `POST /api/v1/territories/{territory_id}/challenge` — Challenge Owner
 * **Auth Required:** `Bearer <TOKEN>`
@@ -520,6 +530,7 @@ Run `status` values are `recording`, `paused` and `completed`.
   "duration_seconds": 540,
   "duration_formatted": "09:00",
   "pace_formatted": "6'12\"",
+  "pace_seconds": 372,
   "current_speed_kmh": 9.7,
   "points_count": 54,
   "is_loop_closed": false,
@@ -581,6 +592,7 @@ Run `status` values are `recording`, `paused` and `completed`.
   "duration_seconds": 1335,
   "duration_formatted": "22:15",
   "pace_formatted": "6'30\"",
+  "pace_seconds": 390,
   "steps": 4210,
   "calories": 310,
   "avg_speed_kmh": 9.2,
@@ -613,7 +625,7 @@ Run `status` values are `recording`, `paused` and `completed`.
   * **Result `status`:**
     * `success` — a new base was minted.
     * `fortified` — the loop matches (> 75% overlap) a base you already hold: its defense level rises and its record pace may improve.
-    * `takeover` — the loop matches a rival's base and your pace beat its record: you now own it.
+    * `takeover` — the loop matches a rival's base and your pace beat its record, or it matches an unclaimed base, which any pace wins: you now own it. Capturing an unclaimed base doesn't award Hostile Takeover.
     * `challenge_failed` — the loop matches a rival's base but you were slower; the base stays with its owner.
   * The run can only be claimed once (any outcome).
 * **Request Body:**
@@ -654,8 +666,9 @@ Run `status` values are `recording`, `paused` and `completed`.
   * `403`
 
 ### `GET /api/v1/bases?user_id={id}&limit=50&offset=0` — List Bases
-* **Auth Required:** No
-* **Notes:** Active bases, newest first. `area` is m², `perimeter` is m (legacy); `area_km2` / `perimeter_km` are also included.
+* **Auth Required:** Optional (a token reveals owners you are allowed to see)
+* **Notes:** Active bases, newest first. `area` is m², `perimeter` is m (legacy); `area_km2` / `perimeter_km` are also included. `user_id` is an empty string when the owner is hidden or the base is unclaimed.
+* **Errors:** `403 "This runner's profile is private"` when `user_id` is a runner hidden from you.
 * **Response `(200 OK)`:**
 ```json
 {
@@ -680,11 +693,11 @@ Run `status` values are `recording`, `paused` and `completed`.
 ```
 The same `bases` item shape is returned by:
 * `GET /api/v1/bases/{base_id}` — a single item.
-* `GET /users/{user_id}/territories` — a runner's held bases.
+* `GET /users/{user_id}/territories` — a runner's held bases, or `403` when that runner is hidden from you.
 * `GET /api/v1/clubs/{club_id}/territories` — a club's bases.
 
 ### `GET /api/v1/bases/user/{user_id}/stats` — Territory Totals
-* **Auth Required:** No
+* **Auth Required:** Optional (`403` when that runner is hidden from you)
 * **Response `(200 OK)`:**
 ```json
 {
@@ -708,7 +721,11 @@ These are kept for older app builds:
 ### `GET /users/me` (Alias: `GET /users/profile`) — Authenticated Runner Profile
 * **Auth Required:** `Bearer <TOKEN>`
 * **Screen / Caller:** `ProfileScreen`, `WelcomeScreen` (session check)
-* **Notes:** `total_territories`, `total_km` and `total_runs` are legacy flat copies of `stats`.
+* **Notes:**
+  * `total_territories`, `total_km` and `total_runs` are legacy flat copies of `stats`.
+  * `auth_provider` is `password`, `google` or `apple`. It decides which account options to show.
+  * `is_premium` unlocks premium colors.
+  * `privacy_level`, `auth_provider`, `is_premium` and `email` are only returned to the runner themselves.
 * **Response `(200 OK)`:**
 ```json
 {
@@ -717,7 +734,8 @@ These are kept for older app builds:
   "email": "runner@example.com",
   "first_name": "Vikram",
   "last_name": "R",
-  "avatar_url": "https://assets.baserun.app/avatars/runner_01.png",
+  "avatar_url": "https://baserun-backend-gamma.vercel.app/api/v1/avatars/5c3cb192c25a4797afd7121b4cf26eeb.jpg",
+  "avatar_thumb_url": "https://baserun-backend-gamma.vercel.app/api/v1/avatars/5c3cb192c25a4797afd7121b4cf26eeb_128.jpg",
   "bio": "Conquering Marina Beach one mile at a time.",
   "city": "Chennai, India",
   "territory_color": "#00E5FF",
@@ -733,14 +751,19 @@ These are kept for older app builds:
     "total_duration_hours": 14.3,
     "bases_claimed": 14,
     "bases_held": 4,
-    "avg_pace": "5'42\""
-  }
+    "avg_pace": "5'42\"",
+    "avg_pace_seconds": 342
+  },
+  "is_restricted": false,
+  "privacy_level": "public",
+  "auth_provider": "password",
+  "is_premium": false
 }
 ```
 
 ### `GET /users/{user_id}/profile` — Public Runner Profile
 * **Auth Required:** Optional
-* **Response `(200 OK)`:** same shape as `/users/me`; `email`, `privacy_level` and `auth_provider` are `null` unless you are viewing your own profile.
+* **Response `(200 OK)`:** same shape as `/users/me`; `email`, `privacy_level`, `auth_provider` and `is_premium` are `null` unless you are viewing your own profile.
 * A runner hidden by their [privacy level](#privacy-levels) comes back as a minimal card with `is_restricted: true`: `username`, `avatar_url` and `territory_color` are real, `first_name` is the username, and everything else is empty or zero. Show "This profile is private" rather than the zeros.
 
 ### `PUT /users/identity` (or `PUT /users/{user_id}` for your own id) — Update Identity
@@ -762,6 +785,7 @@ These are kept for older app builds:
 ```
 Other accepted fields: `username`, `first_name`, `last_name`, `city`, `privacy_level` (`public`, `friends` or `private`).
 * Premium palette colors, and colors that look the same on the map, need `is_premium` (see `/users/me`). A runner already using one keeps it.
+* Don't send a changed `avatar_url` here for a photo the runner uploaded: a different value permanently removes the uploaded photo. Use `POST /users/me/avatar` and `DELETE /users/me/avatar`. Sending the current value back unchanged is harmless.
 * **Response `(200 OK)`:**
 ```json
 {
@@ -769,6 +793,7 @@ Other accepted fields: `username`, `first_name`, `last_name`, `city`, `privacy_l
   "username": "chennairunner",
   "territory_color": "#00E5FF",
   "avatar_url": "https://assets.baserun.app/avatars/runner_01.png",
+  "avatar_thumb_url": "",
   "bio": "Conquering Marina Beach one mile at a time.",
   "club_id": 1,
   "club_name": "Marina Striders",
@@ -797,7 +822,7 @@ Other accepted fields: `username`, `first_name`, `last_name`, `city`, `privacy_l
 ### `DELETE /users/me/avatar` — Remove Profile Photo
 * **Auth Required:** `Bearer <TOKEN>`
 * **Response `(200 OK)`:** the `PUT /users/identity` shape with empty `avatar_url` and `avatar_thumb_url` and `"message": "Profile photo removed"`.
-* Runners without a photo have an empty `avatar_url` everywhere it appears, so show their initials.
+* Runners without a photo have an empty `avatar_url`, or `null` in sign-in and friends responses, so show their initials in both cases.
 
 ### `GET /api/v1/avatars/{key}.jpg` and `{key}_128.jpg` — Profile Photo Images
 * **Auth Required:** No. These are the URLs in `avatar_url` and `avatar_thumb_url`. Use the thumbnail in lists: `/users/me`, profiles, friends responses and the club leaderboard all return it.
@@ -814,7 +839,7 @@ Other accepted fields: `username`, `first_name`, `last_name`, `city`, `privacy_l
   ]
 }
 ```
-`is_primary` means the account was created with that provider. `connected_at` can be `null` for accounts older than this feature.
+`is_primary` means the account was created with that provider, and it can't be disconnected. Password accounts get both entries with `is_primary: false`. `connected_at` can be `null` for accounts older than this feature. Only Google and Apple are supported; Strava and Garmin are not built.
 
 ### `DELETE /users/me/connected-apps/{provider}` — Disconnect
 * **Auth Required:** `Bearer <TOKEN>`
@@ -826,7 +851,10 @@ Other accepted fields: `username`, `first_name`, `last_name`, `city`, `privacy_l
 * **Auth Required:** `Bearer <TOKEN>`
 * **Request Body:** `{ "token": "<fresh ID token from the provider>" }`
 * **Response `(200 OK)`:** the updated list.
-* **Errors:** `400` invalid token, or the provider account's email is not this account's email (a 400 on purpose: the app logs the runner out on a 401).
+* **Errors:**
+  * `400` invalid token, or the provider account's email is not this account's email (a 400 on purpose: the app logs the runner out on a 401)
+  * `404 "Unknown provider"`
+  * `422` missing `token`
 
 ### `POST /users/me/delete` — Delete Account
 * **Auth Required:** `Bearer <TOKEN>`
@@ -843,7 +871,8 @@ Viewers who can't see a runner get:
 | :--- | :--- |
 | `/users/{id}/profile` | The minimal `is_restricted` card |
 | `/users/{id}/territories`, `/users/{id}/achievements`, `/api/v1/bases/user/{id}/stats`, `/api/v1/bases?user_id={id}` | `403 "This runner's profile is private"` |
-| Map, territory and base responses | The base stays visible, with `owner_id` null, `owner_username` `"Private runner"`, no avatar and the default color. A default base name becomes `Private Base`; custom names are kept. |
+| Map, nearby and territory responses | The base stays visible, with `owner_id` null, `owner_username` `"Private runner"`, an empty `owner_avatar` and the default `owner_color` (`#00E5FF`). A default base name becomes `Private Base`; custom names are kept. The club, record pace and stats stay, and the base can still be challenged. |
+| Base items (`/api/v1/bases`, `/api/v1/clubs/{id}/territories`) | Same, with `user_id` as an empty string |
 | Club leaderboard | Rank and totals stay; name and avatar are replaced, and `user_id` is empty |
 | `/api/v1/users/search` | `friends`: found by username only, without name, club or stats. `private`: not found, except by existing friends. |
 | Friends lists and requests | Name, club and stats are `null`; username, avatar and color remain |
@@ -871,6 +900,7 @@ A `private` runner can still be sent a friend request by exact username. Only a 
       "duration": "22:15",
       "duration_seconds": 1335,
       "pace": "6'30\"",
+      "pace_seconds": 390,
       "calories": 310,
       "status": "completed",
       "is_claimed": true,
@@ -881,7 +911,7 @@ A `private` runner can still be sent a friend request by exact username. Only a 
 ```
 
 ### `GET /users/{user_id}/achievements` — Unlocked Badges
-* **Auth Required:** `Bearer <TOKEN>` (any runner may view any runner's badges)
+* **Auth Required:** `Bearer <TOKEN>` (`403` when that runner's privacy level hides them from you)
 * **Screen / Caller:** `ProfileScreen` (Awards section)
 * **Badge catalog (`key`):** `first_run`, `first_conquest`, `5k_conqueror`, `10k_club`, `club_hero`, `hostile_takeover`. Badges are awarded automatically by `/finish` and `claim-from-run`.
 * **Response `(200 OK)`:**
@@ -991,11 +1021,13 @@ Member, territory, area and distance totals are aggregated live. A runner belong
       "username": "chennairunner",
       "runner_name": "chennairunner",
       "avatar_url": "https://assets.baserun.app/avatars/runner_01.png",
+      "avatar_thumb_url": "",
       "runner_avatar": "https://assets.baserun.app/avatars/runner_01.png",
       "territories": 4,
       "territories_held": 4,
       "total_km": 42.8,
       "avg_pace": "5'12\"",
+      "avg_pace_seconds": 312,
       "is_current_user": true
     }
   ]
@@ -1003,7 +1035,7 @@ Member, territory, area and distance totals are aggregated live. A runner belong
 ```
 
 ### `GET /api/v1/clubs/{club_id}/territories` — Club Bases
-* **Auth Required:** No
+* **Auth Required:** Optional (a token reveals owners you are allowed to see)
 * **Response `(200 OK)`:** `{ "total": n, "bases": [ ... ] }` (bases item shape from section 5).
 
 ---
@@ -1020,6 +1052,7 @@ All friends routes require `Bearer <TOKEN>`; the caller always comes from the to
   "first_name": "Vicky",
   "last_name": "S",
   "avatar_url": "https://assets.baserun.app/avatars/runner_02.png",
+  "avatar_thumb_url": null,
   "territory_color": "#E91E63",
   "club_name": "Chennai Runners",
   "total_km": 120.4,
@@ -1117,7 +1150,78 @@ All friends routes require `Bearer <TOKEN>`; the caller always comes from the to
 
 ---
 
-## 9. Migration Notes for Existing App Builds
+## 9. Frontend Change List
+
+Everything the app needs for the account and profile update.
+
+> **Deployment status:** these routes are on the `feat/account-backend` branch and are not in production yet. Until it merges, production answers `404` with `detail: "Not Found"` for them, so keep the "Coming soon" fallback until then. Every other missing resource has a specific `detail`.
+
+### Screens to wire
+
+| Screen | Show | Call | Notes |
+| :--- | :--- | :--- | :--- |
+| Change Password | `auth_provider == "password"` | [`POST /auth/change-password`](#post-authchange-password--change-password) | Keep the current token: this session stays valid. Other devices are signed out. |
+| Connected Apps | All accounts | [`GET`](#get-usersmeconnected-apps--connected-sign-ins), then [`POST`](#post-usersmeconnected-appsprovider--connect-or-reconnect) or [`DELETE`](#delete-usersmeconnected-appsprovider--disconnect) `/users/me/connected-apps/{provider}` | Show Disconnect only when `can_disconnect` is true. Both writes return the new list. Connecting needs a provider ID token. |
+| Delete Account | All accounts | [`POST /users/me/delete`](#post-usersmedelete--delete-account) | Send `password`, or `token` for Google and Apple accounts. Then clear the token and go to sign-in. This is a POST, not a DELETE. |
+| Privacy selector | All accounts | [`PUT /users/identity`](#put-usersidentity-or-put-usersuser_id-for-your-own-id--update-identity) with `privacy_level` | Read the current value from `/users/me`. Values: `public`, `friends`, `private`. |
+| Profile photo | All accounts | [`POST`](#post-usersmeavatar--upload-or-replace-profile-photo) and [`DELETE`](#delete-usersmeavatar--remove-profile-photo) `/users/me/avatar` | The multipart field must be named `file`. Update the UI from the response. |
+| Color picker | All accounts | [`GET /api/v1/app/color-palette`](#get-apiv1appcolor-palette--territory-identity-swatches) | Lock swatches with `is_premium: true` unless `/users/me` has `is_premium: true`. Custom colors close to a premium one also return `403`. |
+
+### Model changes
+
+| Model | Field | Change |
+| :--- | :--- | :--- |
+| Full profile | `avatar_thumb_url`, `is_restricted` | New |
+| Full profile | `privacy_level`, `auth_provider`, `is_premium` | New, nullable: `null` on other runners' profiles |
+| Profile `stats`, leaderboard row | `avg_pace_seconds` | New integer |
+| Live run, run summary, run history | `pace_seconds` | New integer |
+| Identity response, leaderboard row | `avatar_thumb_url` | New string, empty when there is none |
+| `RunnerSummary` | `avatar_thumb_url` | New, nullable |
+| `RunnerSummary` | `first_name`, `last_name`, `club_name`, `total_km`, `bases_held` | Now `null` for hidden runners, so every one must be nullable |
+| Map, nearby and territory items | `owner_id` | Now nullable, including on `active` bases |
+| Map and territory items | `status` | Can now be `unclaimed` |
+| Territory details | `record_pace_seconds` | Nullable |
+| Base items | `user_id` | Can be an empty string |
+| Leaderboard row | `user_id` | Can be an empty string: don't open a profile for that row |
+
+### Behavior to handle
+
+| Case | What the app should do |
+| :--- | :--- |
+| `is_restricted: true` on a profile | Show "This profile is private" instead of the zeroed stats |
+| `403` from a runner's territories, achievements or stats | Same private state, without logging out |
+| `owner_id` is `null` | Don't link to an owner profile. Use `status` to tell an unclaimed base from a hidden owner. |
+| `status: "unclaimed"` on the map | Draw it as neutral, since `owner_color` is only the default color |
+| `status: "unclaimed"` on Territory Details | Hide the record pace and show "Claim Base" |
+| `403` when saving a color | Restore the previous color and show the premium prompt |
+| `403` from `/auth/social-login` | Show `detail` and offer password sign-in |
+| `400` from change password, connect or delete | Show `detail` inline. These are never `401`, so the runner stays signed in. |
+| Photo `413`, `415` or `429` | Show a message. On Vercel, a `413` over about 4.5 MB is not JSON, so don't assume `detail` exists. |
+| Empty or `null` `avatar_url` | Show initials |
+| Lists of runners | Prefer `avatar_thumb_url`, falling back to `avatar_url` |
+
+### Units, pace and weekly goal
+
+The server has no field for any of these. Keep the unit preference and weekly goal on the device.
+
+* **Distance:** the API always returns km. Miles = `km × 0.621371`.
+* **Pace per mile:** `pace_seconds × 1.609344` gives seconds per mile. Format it in the app as `M'SS"`.
+* **Speed:** km/h = `3600 ÷ pace_seconds`.
+* **No pace yet:** `0` means no pace, so show a placeholder and never divide by it.
+* **Weekly goal progress:** add `distance_km` from [`GET /users/{user_id}/runs`](#get-usersuser_idrunslimit20offset0--user-run-history) for completed runs whose `date` falls in the current week. Timestamps are UTC, so convert them to the device's time zone first. Fetch more pages if the last run returned is still inside the week.
+
+### Waiting on something else
+
+| Item | Blocked by |
+| :--- | :--- |
+| Deleting a Google or Apple account | The app needs the Google and Apple sign-in packages to get a fresh ID token |
+| Connecting or reconnecting a provider | Same |
+| Buying premium | No billing exists, so nothing grants `is_premium` yet |
+| Strava and Garmin | Not built; each needs OAuth app credentials |
+
+---
+
+## 10. Migration Notes for Existing App Builds
 
 | Area | Before | Now |
 | :--- | :--- | :--- |
