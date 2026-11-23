@@ -3,7 +3,9 @@ PostgreSQL access layer (asyncpg).
 
 * One connection pool per event loop. Serverless runtimes and test clients
   may run requests on different loops, and an asyncpg pool is bound to the
-  loop that created it.
+  loop that created it. A pool is therefore never closed from a foreign
+  loop/thread (doing so leaves pending IOCP operations behind on Windows and
+  makes the owning loop hang when it shuts down).
 * The schema is applied lazily on first use (and from the app lifespan), so
   cold starts on Vercel work without a separate migration step.
 """
@@ -11,6 +13,7 @@ import asyncio
 import logging
 import os
 import time
+import weakref
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -60,13 +63,28 @@ DEFAULT_SEASON = ("Season 1: Chennai Conquest", datetime(2026, 1, 1, tzinfo=time
 
 class _PoolState:
     def __init__(self):
+        # A pool is bound to the loop that created it; keep one per loop and
+        # never touch another loop's pool from the current thread.
+        self.pools: "weakref.WeakKeyDictionary[asyncio.AbstractEventLoop, asyncpg.Pool]" = (
+            weakref.WeakKeyDictionary()
+        )
+        self.locks: "weakref.WeakKeyDictionary[asyncio.AbstractEventLoop, asyncio.Lock]" = (
+            weakref.WeakKeyDictionary()
+        )
         self.pool: Optional[asyncpg.Pool] = None
         self.loop: Optional[asyncio.AbstractEventLoop] = None
-        self.lock: Optional[asyncio.Lock] = None
         self.schema_ready = False
 
 
 _state = _PoolState()
+
+
+def _prune_closed_loops() -> None:
+    """Forget pools whose loop is gone (never close them from this loop)."""
+    for loop in [loop for loop in _state.pools if loop.is_closed()]:
+        _state.pools.pop(loop, None)
+    for loop in [loop for loop in _state.locks if loop.is_closed()]:
+        _state.locks.pop(loop, None)
 
 
 async def _create_pool(config: DatabaseConfig) -> asyncpg.Pool:
@@ -83,18 +101,18 @@ async def _create_pool(config: DatabaseConfig) -> asyncpg.Pool:
 
 async def get_pool() -> asyncpg.Pool:
     loop = asyncio.get_running_loop()
-    if _state.loop is not loop:
-        stale_pool = _state.pool
-        _state.pool, _state.loop, _state.lock = None, loop, asyncio.Lock()
-        if stale_pool is not None:
-            try:
-                stale_pool.terminate()
-            except Exception:  # its loop is already gone
-                pass
+    _state.loop = loop
+    _prune_closed_loops()
 
-    if _state.pool is None:
-        async with _state.lock:
-            if _state.pool is None:
+    pool = _state.pools.get(loop)
+    if pool is None:
+        lock = _state.locks.get(loop)
+        if lock is None:
+            lock = asyncio.Lock()
+            _state.locks[loop] = lock
+        async with lock:
+            pool = _state.pools.get(loop)
+            if pool is None:
                 pool = await _create_pool(db_config)
                 try:
                     if not _state.schema_ready and AUTO_MIGRATE:
@@ -104,8 +122,9 @@ async def get_pool() -> asyncpg.Pool:
                 except BaseException:
                     await pool.close()
                     raise
-                _state.pool = pool
-    return _state.pool
+                _state.pools[loop] = pool
+    _state.pool = pool
+    return pool
 
 
 async def init_db() -> None:
@@ -114,7 +133,15 @@ async def init_db() -> None:
 
 
 async def close_db() -> None:
-    pool, _state.pool, _state.loop = _state.pool, None, None
+    """Close the pool that belongs to the current event loop, if any."""
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        loop = None
+
+    pool = _state.pools.pop(loop, None) if loop is not None else None
+    _state.pool, _state.loop = None, None
+    _prune_closed_loops()
     if pool is not None:
         try:
             await pool.close()
